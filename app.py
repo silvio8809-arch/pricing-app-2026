@@ -2,106 +2,113 @@ import streamlit as st
 from supabase import create_client
 import pandas as pd
 import plotly.express as px
+import re
 
 # --- 1. CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Sistema de Precificação 2026", layout="wide")
+st.set_page_config(page_title="Simulador Pricing 2026", layout="wide")
 
-# --- 2. CONEXÃO COM O BANCO DE DADOS ---
+# --- 2. CONEXÃO COM O SUPABASE ---
 def init_connection():
-    # Usa as chaves reais que você salvou nos 'Secrets' do Streamlit
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
 
-try:
-    supabase = init_connection()
-except Exception as e:
-    st.error("Erro na conexão com o banco de dados. Verifique os 'Secrets'.")
-    st.stop()
+supabase = init_connection()
 
-# --- 3. SISTEMA DE AUTENTICAÇÃO ---
+# --- 3. INTELIGÊNCIA DE CONEXÃO: AUTO-FIX ONEDRIVE ---
+def universal_onedrive_fixer(url):
+    """
+    Converte links do OneDrive/SharePoint em links de download direto.
+    """
+    if not url: return None
+    iframe_match = re.search(r'src="([^"]+)"', url)
+    if iframe_match: url = iframe_match.group(1)
+
+    if "sharepoint.com" in url:
+        return url.replace("onedrive.aspx", "download.aspx").replace("?id=", "?download=1&id=")
+    elif "onedrive.live.com" in url:
+        return url.replace("redir?", "download?").replace("resid=", "resid=") + "&authkey="
+    return url
+
+# --- 4. FUNÇÕES DE AUTENTICAÇÃO ---
+def recuperar_senha(email):
+    try:
+        supabase.auth.reset_password_for_email(email)
+        return True
+    except:
+        return False
+
+# --- 5. LÓGICA DE NAVEGAÇÃO E LOGIN ---
 if 'autenticado' not in st.session_state:
     st.session_state['autenticado'] = False
+    st.session_state['perfil'] = None
 
 if not st.session_state['autenticado']:
-    # TELA DE LOGIN (Opção B)
-    st.title("🔐 Acesso Restrito - Precificação")
-    col_login, _ = st.columns([1, 2])
-    with col_login:
-        email_input = st.text_input("E-mail Cadastrado")
-        senha_input = st.text_input("Senha", type="password")
-        if st.button("Entrar no Sistema"):
-            # Consulta a tabela 'usuarios' que você criou no SQL Editor do Supabase
-            res = supabase.table("usuarios").select("*").eq("email", email_input).eq("senha", senha_input).execute()
+    st.title("🔐 Simulador de Pricing 2026")
+    tab_login, tab_senha = st.tabs(["Login", "Esqueci minha senha"])
+    
+    with tab_login:
+        email = st.text_input("E-mail")
+        senha = st.text_input("Senha", type="password")
+        if st.button("Acessar"):
+            # Verifica na tabela 'usuarios' se existe e qual o perfil
+            res = supabase.table("usuarios").select("*").eq("email", email).eq("senha", senha).execute()
             if len(res.data) > 0:
                 st.session_state['autenticado'] = True
-                st.success("Login realizado!")
+                st.session_state['perfil'] = res.data[0].get('perfil', 'Vendedor')
                 st.rerun()
             else:
-                st.error("Usuário ou senha incorretos.")
+                st.error("Credenciais inválidas")
+                
+    with tab_senha:
+        email_rec = st.text_input("E-mail para recuperação")
+        if st.button("Enviar link de recuperação"):
+            if recuperar_senha(email_rec):
+                st.success("Link enviado para o seu e-mail!")
+            else:
+                st.error("Erro ao enviar. Verifique o e-mail.")
+
 else:
-    # --- 4. DASHBOARD COMPLETO (ÁREA SEGURA) ---
+    # --- 6. INTERFACE LOGADA ---
+    st.sidebar.title(f"👤 {st.session_state['perfil']}")
+    menu = ["📊 Simulador", "📜 Histórico"]
+    if st.session_state['perfil'] == 'Admin':
+        menu.append("⚙️ Configurações")
     
-    # Barra Lateral (Menu e Filtros)
-    st.sidebar.title("Configurações")
-    st.sidebar.button("🚪 Sair", on_click=lambda: st.session_state.update({"autenticado": False}))
+    escolha = st.sidebar.radio("Navegação", menu)
     st.sidebar.divider()
-    
-    st.sidebar.header("Parâmetros do Produto")
-    sku = st.sidebar.selectbox("SKU / Produto", ["PRODUTO-TESTE-01", "PRODUTO-TESTE-02", "NOVO PRODUTO"])
-    uf = st.sidebar.selectbox("UF de Destino", ["SP", "RJ", "MG", "PR", "SC", "RS", "BA"])
-    
-    custo_fixo_prod = st.sidebar.number_input("Custo de Compra (R$)", value=50.0)
-    preco_venda = st.sidebar.number_input("Preço de Venda Sugerido (R$)", value=100.0)
-    
-    # Cálculos de Precificação (Exemplo com 18% de imposto fixo inicial)
-    aliq_imposto = 0.18
-    valor_imposto = preco_venda * aliq_imposto
-    receita_liquida = preco_venda - valor_imposto
-    margem_abs = receita_liquida - custo_fixo_prod
-    margem_perc = (margem_abs / preco_venda) * 100 if preco_venda > 0 else 0
+    st.sidebar.button("Sair", on_click=lambda: st.session_state.update({"autenticado": False}))
 
-    # TELA PRINCIPAL
-    st.title(f"📊 Simulador de Preço - {sku}")
-    
-    # Cartões de Resumo (Metrics)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Receita Líquida", f"R$ {receita_liquida:,.2f}", f"-{aliq_imposto*100}% Impostos", delta_color="inverse")
-    c2.metric("Margem de Contribuição", f"R$ {margem_abs:,.2f}", f"{margem_perc:.1f}%")
-    c3.metric("Ponto de Equilíbrio", f"R$ {custo_fixo_prod / (1-aliq_imposto):,.2f}", "Preço Mínimo")
+    # --- TELA: SIMULADOR ---
+    if escolha == "📊 Simulador":
+        st.title("Simulador de Margem EBITDA")
+        
+        # Parâmetros Dinâmicos (Supabase)
+        try:
+            params_res = supabase.table("config_parametros").select("*").execute()
+            df_params = pd.DataFrame(params_res.data)
+        except:
+            df_params = pd.DataFrame() # Fallback
 
-    st.divider()
+        # Entrada de Dados
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            sku = st.text_input("SKU do Produto")
+            uf = st.selectbox("UF de Destino", ["SP", "RJ", "MG", "BA", "PR", "SC", "RS"])
+        with col2:
+            preco_venda = st.number_input("Preço Sugerido (R$)", value=100.0)
+            custo_inv = st.number_input("Custo Inventário (R$)", value=45.0)
+        with col3:
+            clientes_vpc = st.checkbox("Elegível a VPC (Desconto)")
 
-    # Seção de Gráficos
-    g1, g2 = st.columns(2)
-    
-    with g1:
-        st.subheader("Composição do Preço")
-        df_pie = pd.DataFrame({
-            "Componente": ["Custo", "Impostos", "Margem Lucro"],
-            "Valor": [custo_fixo_prod, valor_imposto, max(0, margem_abs)]
-        })
-        fig_pie = px.pie(df_pie, values="Valor", names="Componente", hole=0.5, color_discrete_sequence=px.colors.qualitative.Pastel)
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    with g2:
-        st.subheader("Comparativo de Valores")
-        df_bar = pd.DataFrame({
-            "Item": ["Preço Bruto", "Receita Líquida", "Margem"],
-            "R$": [preco_venda, receita_liquida, margem_abs]
-        })
-        fig_bar = px.bar(df_bar, x="Item", y="R$", color="Item", text_auto='.2f')
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-    # Registro no Supabase
-    st.divider()
-    if st.button("💾 Registrar Simulação no Banco de Dados"):
-        dados_salvar = {
-            "sku": sku,
-            "preco": preco_venda,
-            "margem": margem_abs,
-            "uf": uf
-        }
-        # Tenta salvar (lembre-se que você precisa criar a tabela 'simulacoes' no Supabase se quiser salvar dados reais lá)
-        st.success(f"Simulação do SKU {sku} registrada com sucesso!")
-        st.balloons()
+        # MOTOR DE CÁLCULO
+        imposto = 0.18  # Alíquota padrão
+        frete = 5.0    # Simulação de Lookup por UF
+        comissao = 0.03 # 3%
+        vpc = 0.05 if clientes_vpc else 0.0
+        custo_fixo_rateado = 10.0
+        
+        rec_liquida = preco_venda * (1 - imposto)
+        margem_contribuicao = rec_liquida - (custo_inv + frete + (preco_venda * comissao) + (preco_venda * vpc))
+        margem_ebitda = margem_contribuicao - custo_fixo_rateado
+        perc_ebitda = (margem_ebitda / preco_
