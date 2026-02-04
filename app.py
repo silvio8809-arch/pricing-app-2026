@@ -1,8 +1,9 @@
 import streamlit as st
 from supabase import create_client
 import pandas as pd
+import plotly.express as px
 
-# 1. Conexão com o Supabase usando seus "Secrets"
+# 1. Conexão com o Supabase
 def init_connection():
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_KEY"]
@@ -10,38 +11,50 @@ def init_connection():
 
 supabase = init_connection()
 
-# 2. Controle da Tela (Login ou Dashboard)
+# 2. Lógica de Login
 if 'autenticado' not in st.session_state:
     st.session_state['autenticado'] = False
 
 if not st.session_state['autenticado']:
-    # --- TELA DE LOGIN ---
-    st.title("🔐 Acesso Privado - Precificação")
-    st.subheader("Por favor, faça o login para continuar")
-    
+    st.title("🔐 Acesso Privado")
     email_input = st.text_input("E-mail")
     senha_input = st.text_input("Senha", type="password")
-    
     if st.button("Acessar Sistema"):
-        # Verifica se o e-mail e senha existem na tabela que você criou no Supabase
         res = supabase.table("usuarios").select("*").eq("email", email_input).eq("senha", senha_input).execute()
-        
         if len(res.data) > 0:
             st.session_state['autenticado'] = True
-            st.success("Login realizado com sucesso!")
             st.rerun()
         else:
-            st.error("E-mail ou senha incorretos. Tente novamente.")
+            st.error("Dados incorretos")
 else:
-    # --- TELA DO DASHBOARD (O QUE VOCÊ JÁ TINHA) ---
-    st.sidebar.button("Sair do Sistema", on_click=lambda: st.session_state.update({"autenticado": False}))
+    # --- TUDO A PARTIR DAQUI SÓ APARECE DEPOIS DO LOGIN ---
+    st.sidebar.button("Sair", on_click=lambda: st.session_state.update({"autenticado": False}))
     
-    st.title("📊 Simulador de Preços 2026")
-    st.write(f"Bem-vindo ao sistema seguro!")
+    st.title("📊 Simulador de Preço 2026")
     
-    # Aqui o código do seu dashboard continua normalmente...
-    st.info("Você está logado e seus dados estão protegidos.")
+    # Adicionando os seus Parâmetros na lateral
+    with st.sidebar:
+        st.header("Parâmetros")
+        sku = st.text_input("SKU", value="PRODUTO-TESTE-01")
+        preco_sugerido = st.number_input("Preço Sugerido (R$)", value=100.0)
+        imposto = 0.18 # Exemplo de 18%
     
-    # Exemplo de um botão que você já tinha
+    # Cálculos
+    receita_liquida = preco_sugerido * (1 - imposto)
+    margem = receita_liquida - 50 # Exemplo: custo fixo de 50
+    
+    # Exibindo os Cartões que você gosta
+    col1, col2 = st.columns(2)
+    col1.metric("Receita Líquida", f"R$ {receita_liquida:,.2f}", f"-{imposto*100}% Impostos", delta_color="inverse")
+    col2.metric("Margem de Contribuição", f"R$ {margem:,.2f}")
+
+    # Gráfico Simples
+    df_grafico = pd.DataFrame({
+        'Categoria': ['Preço Bruto', 'Impostos', 'Receita Líquida'],
+        'Valor': [preco_sugerido, preco_sugerido*imposto, receita_liquida]
+    })
+    fig = px.bar(df_grafico, x='Categoria', y='Valor', color='Categoria')
+    st.plotly_chart(fig)
+
     if st.button("Registrar Simulação"):
-        st.success("Simulação salva no banco de dados!")
+        st.success("Dados salvos com sucesso no Supabase!")
