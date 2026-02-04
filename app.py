@@ -1,186 +1,118 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from supabase import create_client
 
-import React, { useState, useEffect } from 'react';
-import { ProductData, SimulationResult } from '../types';
-import { formatCurrency } from '../services/pricingEngine';
-import { getPricingInsights } from '../services/geminiService';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell, PieChart, Pie } from 'recharts';
+# Configurações de página
+st.set_page_config(page_title="Simulador de Preço 2026", layout="wide")
 
-interface PricingDashboardProps {
-  product: ProductData;
-  result: SimulationResult | null;
-  suggestedPrice: number;
-  userEmail: string;
-  uf: string;
+# Conexão com Supabase (Segredos)
+@st.cache_resource
+def init_connection():
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    return create_client(url, key)
+
+supabase = init_connection()
+
+# Funções de Formatação
+def format_currency(value):
+    return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+# --- SIMULAÇÃO DE DADOS (Substitua pela sua lógica de leitura do OneDrive se necessário) ---
+# Aqui estou recriando a lógica que estava no seu arquivo React para Python
+def calculate_metrics(price, cost, tax_pct, freight, fixed_cost):
+    revenue_net = price * (1 - (tax_pct / 100))
+    variable_costs = cost + freight
+    contribution_margin = revenue_net - variable_costs
+    ebitda_margin = contribution_margin - fixed_cost
+    status = 'profit' if ebitda_margin > 0 else 'loss'
+    return {
+        "receita_liquida": revenue_net,
+        "margem_contribuicao": contribution_margin,
+        "ebitda_final": ebitda_margin,
+        "status": status,
+        "ebitda_pct": (ebitda_margin / price) * 100 if price > 0 else 0
+    }
+
+# --- INTERFACE STREAMLIT ---
+st.title("📊 Simulação de Preço")
+st.subheader("Resultados projetados para 2026")
+
+# Barra Lateral para Inputs
+with st.sidebar:
+    st.header("Parâmetros")
+    sku = st.text_input("SKU", value="PRODUTO-TESTE-01")
+    uf = st.selectbox("UF", ["SP", "RJ", "MG", "BA", "PR"])
+    suggested_price = st.number_input("Preço Sugerido (R$)", value=100.0)
+    
+    st.divider()
+    if st.button("Registrar Simulação"):
+        st.toast("Simulação registrada no Supabase!")
+
+# Dados de exemplo (No futuro, estes virão das suas planilhas)
+product_data = {
+    "Custo": 45.0,
+    "Impostos": 18.0,
+    "Frete": 5.0,
+    "Custo_Fixo": 10.0
 }
 
-const PricingDashboard: React.FC<PricingDashboardProps> = ({ product, result, suggestedPrice, userEmail, uf }) => {
-  const [aiInsight, setAiInsight] = useState<string>('Analisando estratégia...');
-  const [isLogging, setIsLogging] = useState(false);
+result = calculate_metrics(
+    suggested_price, 
+    product_data["Custo"], 
+    product_data["Impostos"], 
+    product_data["Frete"], 
+    product_data["Custo_Fixo"]
+)
 
-  useEffect(() => {
-    if (result) {
-      setAiInsight('Solicitando insight estratégico...');
-      getPricingInsights(product, result, suggestedPrice).then(setAiInsight);
-    }
-  }, [product, result, suggestedPrice]);
+# --- MÉTRICAS PRINCIPAIS ---
+col1, col2, col3 = st.columns(3)
 
-  if (!result) return null;
+with col1:
+    st.metric("Receita Líquida Estimada", format_currency(result["receita_liquida"]), f"-{product_data['Impostos']}% Impostos")
 
-  const chartData = [
-    { name: 'Custo Base', value: product.Custo },
-    { name: 'Variáveis', value: result.custosVariaveis - product.Custo },
-    { name: 'Custos Fixos', value: product.Custo_Fixo },
-    { name: 'Margem EBITDA', value: Math.max(0, result.margemEbitda) }
-  ];
+with col2:
+    st.metric("Margem de Contribuição", format_currency(result["margem_contribuicao"]))
 
-  const handleLog = () => {
-    setIsLogging(true);
-    // Simulate Supabase Insert
-    setTimeout(() => {
-      setIsLogging(false);
-      alert('Simulação registrada com sucesso no log operacional.');
-    }, 600);
-  };
+with col3:
+    color = "normal" if result["status"] == 'profit' else "inverse"
+    st.metric(
+        "Margem EBITDA Final", 
+        format_currency(result["ebitda_final"]), 
+        f"{result['ebitda_pct']:.1f}%",
+        delta_color=color
+    )
 
-  return (
-    <div className="space-y-8 animate-fadeIn">
-      <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold text-slate-900">Simulação de Preço</h1>
-          <p className="text-slate-500">Resultados projetados para {product.SKU} em {uf}</p>
-        </div>
-        <button 
-          onClick={handleLog}
-          disabled={isLogging}
-          className="bg-green-600 hover:bg-green-700 text-white font-semibold py-2 px-6 rounded-lg shadow-sm transition flex items-center gap-2 self-start"
-        >
-          {isLogging ? (
-            <span className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></span>
-          ) : (
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
-          )}
-          Registrar Simulação
-        </button>
-      </header>
+# --- GRÁFICO E INSIGHT ---
+col_graph, col_ai = st.columns([2, 1])
 
-      {/* Primary Metrics */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-          <p className="text-sm font-medium text-slate-500">Receita Líquida Estimada</p>
-          <p className="text-2xl font-bold text-slate-900 mt-1">{formatCurrency(result.receitaLiquida)}</p>
-          <div className="mt-2 text-xs text-slate-400">Pós-impostos ({product.Impostos}%)</div>
-        </div>
+with col_graph:
+    st.write("### Composição do Preço")
+    fig = go.Figure(go.Bar(
+        x=['Custo Base', 'Variáveis', 'Custo Fixo', 'Margem EBITDA'],
+        y=[product_data["Custo"], product_data["Frete"], product_data["Custo_Fixo"], max(0, result["ebitda_final"])],
+        marker_color=['#3b82f6', '#3b82f6', '#3b82f6', '#10b981' if result["status"] == 'profit' else '#ef4444']
+    ))
+    fig.update_layout(height=350, margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(fig, use_container_width=True)
 
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-          <p className="text-sm font-medium text-slate-500">Margem de Contribuição</p>
-          <p className="text-2xl font-bold text-slate-900 mt-1">{formatCurrency(result.margemContribuicao)}</p>
-          <div className="mt-2 text-xs text-slate-400">Total Variável: {formatCurrency(result.custosVariaveis)}</div>
-        </div>
+with col_ai:
+    st.info("### 💡 Insight IA Gemini")
+    st.write(f"O produto **{sku}** apresenta uma lucratividade de **{result['ebitda_pct']:.1f}%**. "
+             "Sugerimos monitorar o custo de frete para a região de destino para otimizar a margem.")
 
-        <div className={`p-6 rounded-xl shadow-sm border transition duration-300 ${result.status === 'profit' ? 'bg-green-50 border-green-200' : 'bg-red-50 border-red-200'}`}>
-          <div className="flex justify-between items-start">
-            <p className="text-sm font-medium text-slate-600">Margem EBITDA Final</p>
-            <span className="text-xl">{result.status === 'profit' ? '🟢' : '🔴'}</span>
-          </div>
-          <p className={`text-2xl font-bold mt-1 ${result.status === 'profit' ? 'text-green-700' : 'text-red-700'}`}>
-            {formatCurrency(result.margemEbitda)}
-          </p>
-          <div className="mt-2 text-xs opacity-70">
-            Lucratividade: {((result.margemEbitda / suggestedPrice) * 100).toFixed(1)}%
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        {/* Composition Chart */}
-        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-          <h3 className="text-lg font-bold text-slate-800 mb-6">Composição do Preço</h3>
-          <div className="h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
-                <XAxis dataKey="name" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} />
-                <YAxis stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(val) => `R$${val}`} />
-                <Tooltip 
-                  contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1)' }}
-                  formatter={(val: number) => [formatCurrency(val), 'Valor']}
-                />
-                <Bar dataKey="value" radius={[4, 4, 0, 0]}>
-                  {chartData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={index === 3 ? (result.status === 'profit' ? '#10b981' : '#ef4444') : '#3b82f6'} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-        {/* AI Insights Card */}
-        <div className="bg-blue-900 text-white p-6 rounded-xl shadow-lg relative overflow-hidden flex flex-col">
-          <div className="absolute top-0 right-0 p-4 opacity-10">
-            <svg className="w-24 h-24" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z"/></svg>
-          </div>
-          <div className="relative z-10 flex flex-col h-full">
-            <h3 className="text-lg font-bold flex items-center gap-2 mb-4">
-              <svg className="w-5 h-5 text-blue-300" fill="currentColor" viewBox="0 0 20 20"><path d="M11 3a1 1 0 10-2 0v1a1 1 0 102 0V3zM15.657 5.757a1 1 0 00-1.414-1.414l-.707.707a1 1 0 001.414 1.414l.707-.707zM18 10a1 1 0 01-1 1h-1a1 1 0 110-2h1a1 1 0 011 1zM5.05 6.464A1 1 0 106.464 5.05l-.707-.707a1 1 0 00-1.414 1.414l.707.707zM5 10a1 1 0 01-1 1H3a1 1 0 110-2h1a1 1 0 011 1zM8 16v-1a1 1 0 112 0v1a1 1 0 11-2 0zM13.536 14.95a1 1 0 011.414 1.414l-.707.707a1 1 0 01-1.414-1.414l.707-.707zM6.464 14.95a1 1 0 010 1.414l-.707.707a1 1 0 01-1.414-1.414l.707-.707z"></path></svg>
-              Insight IA Gemini
-            </h3>
-            <p className="text-blue-100 text-lg italic leading-relaxed flex-1">
-              "{aiInsight}"
-            </p>
-            <div className="mt-6 pt-6 border-t border-blue-800 text-xs text-blue-300">
-              Análise baseada em parâmetros de mercado projetados para 2026.
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Detailed Breakdown Table */}
-      <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-        <div className="p-4 border-b border-slate-200 bg-slate-50">
-          <h3 className="font-bold text-slate-800">Detalhamento Financeiro (Unitário)</h3>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left">
-            <thead className="text-xs uppercase text-slate-500 bg-slate-50 font-bold">
-              <tr>
-                <th className="px-6 py-3">Componente</th>
-                <th className="px-6 py-3">Valor Nominal</th>
-                <th className="px-6 py-3">% S/ Preço Bruto</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 text-sm">
-              <tr>
-                <td className="px-6 py-4 font-medium text-slate-900">Preço Bruto</td>
-                <td className="px-6 py-4">{formatCurrency(suggestedPrice)}</td>
-                <td className="px-6 py-4">100.0%</td>
-              </tr>
-              <tr>
-                <td className="px-6 py-4 font-medium text-slate-900 text-red-600">Impostos</td>
-                <td className="px-6 py-4">{formatCurrency(suggestedPrice * (product.Impostos / 100))}</td>
-                <td className="px-6 py-4">{product.Impostos.toFixed(1)}%</td>
-              </tr>
-              <tr>
-                <td className="px-6 py-4 font-medium text-slate-900">Custo Mercadoria</td>
-                <td className="px-6 py-4">{formatCurrency(product.Custo)}</td>
-                <td className="px-6 py-4">{((product.Custo / suggestedPrice) * 100).toFixed(1)}%</td>
-              </tr>
-              <tr>
-                <td className="px-6 py-4 font-medium text-slate-900">Logística / Frete</td>
-                <td className="px-6 py-4">{formatCurrency(product.Frete)}</td>
-                <td className="px-6 py-4">{((product.Frete / suggestedPrice) * 100).toFixed(1)}%</td>
-              </tr>
-              <tr className="bg-slate-50 font-bold">
-                <td className="px-6 py-4 text-blue-800">Margem EBITDA</td>
-                <td className="px-6 py-4 text-blue-800">{formatCurrency(result.margemEbitda)}</td>
-                <td className="px-6 py-4 text-blue-800">{((result.margemEbitda / suggestedPrice) * 100).toFixed(1)}%</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-export default PricingDashboard;
+# --- TABELA DETALHADA ---
+st.write("### Detalhamento Financeiro (Unitário)")
+df_data = {
+    "Componente": ["Preço Bruto", "Impostos", "Custo Mercadoria", "Logística / Frete", "Margem EBITDA"],
+    "Valor Nominal": [
+        format_currency(suggested_price),
+        format_currency(suggested_price * (product_data["Impostos"]/100)),
+        format_currency(product_data["Custo"]),
+        format_currency(product_data["Frete"]),
+        format_currency(result["ebitda_final"])
+    ],
+    "% S/ Preço Bruto": ["100%", f"{product_data['Impostos']}%", f"{(product_data['Custo']/suggested_price)*100:.1f}%", f"{(product_data['Frete']/suggested_price)*100:.1f}%", f"{result['ebitda_pct']:.1f}%"]
+}
+st.table(pd.DataFrame(df_data))
