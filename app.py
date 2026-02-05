@@ -4,7 +4,7 @@ import pandas as pd
 import re
 
 # --- 1. CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Pricing Estratégico 2026 - v2.4.1", layout="wide")
+st.set_page_config(page_title="Pricing Estratégico 2026 - v2.5.0", layout="wide")
 
 # --- 2. CONEXÃO COM O SUPABASE ---
 def init_connection():
@@ -18,7 +18,7 @@ except Exception as e:
     st.error("Erro crítico de conexão. Verifique os Secrets.")
     st.stop()
 
-# --- 3. UTILITÁRIOS (ONEDRIVE) ---
+# --- 3. UTILITÁRIOS ---
 def universal_onedrive_fixer(url):
     if not url or not isinstance(url, str): return None
     iframe_match = re.search(r'src="([^"]+)"', url)
@@ -79,9 +79,8 @@ else:
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            lista_skus = df_precos['SKU'].unique().tolist() if not df_precos.empty else ["Carregue a base 'Preços Atuais'..."]
+            lista_skus = df_precos['SKU'].unique().tolist() if not df_precos.empty else ["Aguardando Base..."]
             sku_sel = st.selectbox("Selecione o SKU", lista_skus)
-            
             ufs = ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"]
             uf_sel = st.selectbox("UF de Destino", ufs)
 
@@ -98,58 +97,40 @@ else:
 
         with col3:
             # PARÂMETROS DO MANUAL 5.1
-            tributos = 0.15   
-            devolucao = 0.03  
-            comissao = 0.03   
-            bonificacao = 0.01 
-            mod_tax = 0.01    # 1% sobre Custo Mercadoria
-            mc_alvo = 0.09    
-            overhead = 0.16   
+            tributos, devolucao, comissao, bonificacao = 0.15, 0.03, 0.03, 0.01
+            mod_tax, mc_alvo, overhead = 0.01, 0.09, 0.16
 
-            # Cálculo de Markup para atingir MC Alvo
             soma_perc_sobre_receita = tributos + devolucao + comissao + bonificacao + mc_alvo
             custo_operacional_total = (custo_base * (1 + mod_tax)) + frete_final
-            
             preco_calc = custo_operacional_total / (1 - soma_perc_sobre_receita) if soma_perc_sobre_receita < 1 else 0
             preco_final = st.number_input("Preço Sugerido (R$)", value=round(preco_calc, 2))
 
         # --- RESULTADOS ---
         receita_liquida = preco_final * (1 - tributos)
-        
-        # MC = Rec. Líquida - (Custo Merc. + MOD + Frete + Comissão + Bonif + Devolução)
         custo_variavel_total = custo_operacional_total + (preco_final * (comissao + bonificacao + devolucao))
         mc_valor = receita_liquida - custo_variavel_total
         perc_mc = (mc_valor / preco_final * 100) if preco_final > 0 else 0
-        
-        # EBITDA = MC - Overhead
         ebitda_valor = mc_valor - (preco_final * overhead)
         perc_ebitda = (ebitda_valor / preco_final * 100) if preco_final > 0 else 0
 
         st.divider()
         res1, res2, res3 = st.columns(3)
-        cor_delta = "normal" if perc_mc >= 9 else "inverse"
-        
-        res1.metric("Margem de Contribuição (MC)", f"R$ {mc_valor:,.2f}", f"{perc_mc:.1f}%", delta_color=cor_delta)
+        res1.metric("Margem de Contribuição (MC)", f"R$ {mc_valor:,.2f}", f"{perc_mc:.1f}%")
         res2.metric("EBITDA", f"R$ {ebitda_valor:,.2f}", f"{perc_ebitda:.1f}%")
         res3.metric("Receita Líquida", f"R$ {receita_liquida:,.2f}")
 
     # --- TELA: CONFIGURAÇÕES MASTER ---
     elif escolha == "⚙️ Configurações Master":
         st.title("⚙️ Gestão de Planilhas OneDrive")
+        
         bases = ["Inventário", "Frete", "Bonificações", "Preços Atuais", "VPC"]
+        
         for b in bases:
-            with st.expander(f"Configurar: {b}"):
-                res_l = supabase.table("config_links").select("url_link").eq("base_nome", b).execute()
-                u_v = res_l.data[0]['url_link'] if res_l.data else ""
-                n_u = st.text_input(f"Link para {b}", value=u_v, key=b)
-                if st.button(f"Salvar Link {b}"):
-                    f_l = universal_onedrive_fixer(n_u)
-                    supabase.table("config_links").upsert({"base_nome": b, "url_link": f_l}).execute()
-                    st.success("Link atualizado!")
-                    st.rerun()
-
-    # --- TELA: USUÁRIOS ---
-    elif escolha == "👤 Usuários":
-        st.title("👤 Gestão de Usuários")
-        u_data = supabase.table("usuarios").select("email, perfil").execute()
-        st.table(pd.DataFrame(u_data.data))
+            # Lógica do Indicador de Status
+            res_l = supabase.table("config_links").select("url_link").eq("base_nome", b).execute()
+            u_v = res_l.data[0]['url_link'] if res_l.data else ""
+            
+            # Define o ícone e a cor baseada no conteúdo
+            status_icon = "✅ Ativo" if u_v else "❌ Pendente"
+            
+            with st.expander(f"{status_icon} - Configurar: {
