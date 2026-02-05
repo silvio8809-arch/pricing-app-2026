@@ -3,20 +3,19 @@ from supabase import create_client
 import pandas as pd
 import re
 
-# --- 1. CONFIGURAÇÃO ---
-st.set_page_config(page_title="Pricing 2026 - v2.6.1", layout="wide")
+# --- 1. CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(page_title="Pricing 2026 - v2.7.0", layout="wide")
 
 # --- 2. CONEXÃO SUPABASE ---
 def init_connection():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
+    except Exception:
+        return None
 
-try:
-    supabase = init_connection()
-    db_status = True
-except Exception:
-    db_status = False
+supabase = init_connection()
 
 # --- 3. MOTOR DE DADOS ONEDRIVE ---
 def universal_onedrive_fixer(url):
@@ -42,35 +41,45 @@ if 'autenticado' not in st.session_state:
 
 if not st.session_state['autenticado']:
     st.title("🔐 Login - Pricing Corporativo")
-    with st.form("login"):
+    with st.form("login_form"):
         u_email = st.text_input("E-mail")
         u_senha = st.text_input("Senha", type="password")
         if st.form_submit_button("Entrar"):
-            res = supabase.table("usuarios").select("*").eq("email", u_email).eq("senha", u_senha).execute()
-            if res.data:
-                st.session_state.update({'autenticado': True, 'perfil': res.data[0]['perfil']})
-                st.rerun()
-            else: st.error("Acesso negado.")
+            if supabase:
+                res = supabase.table("usuarios").select("*").eq("email", u_email).eq("senha", u_senha).execute()
+                if res.data:
+                    st.session_state.update({'autenticado': True, 'perfil': res.data[0]['perfil']})
+                    st.rerun()
+                else: st.error("Acesso negado.")
+            else: st.error("Erro de conexão com o Banco de Dados.")
 else:
-    # --- 5. MONITOR DE STATUS NA SIDEBAR ---
+    # --- 5. INTERFACE E STATUS DE CONEXÃO ---
     st.sidebar.title(f"👤 {st.session_state['perfil']}")
     
-    # Correção do erro da linha 60
+    # Status de Conexão Ativa na Sidebar (Resolvendo AttributeError da linha 60)
     st.sidebar.markdown("---")
-    st.sidebar.write("📡 **Status do Sistema**")
-    if db_status:
-        st.sidebar.success("Conexão Supabase: OK")
+    st.sidebar.write("📡 **Conectividade**")
+    if supabase:
+        st.sidebar.success("Supabase: Online")
     else:
-        st.sidebar.error("Conexão Supabase: Falha")
+        st.sidebar.error("Supabase: Offline")
 
-    escolha = st.sidebar.radio("Menu", ["📊 Simulador", "⚙️ Configurações Master", "👤 Usuários"])
+    menu = ["📊 Simulador", "⚙️ Configurações Master"]
+    if st.session_state['perfil'] == 'Admin':
+        menu.append("👤 Usuários")
+    escolha = st.sidebar.radio("Navegação", menu)
 
-    # Carregar Links
-    links_res = supabase.table("config_links").select("*").execute()
-    links_dict = {item['base_nome']: item['url_link'] for item in links_res.data}
+    # Carregar Links das Bases
+    links_dict = {}
+    if supabase:
+        try:
+            links_res = supabase.table("config_links").select("*").execute()
+            links_dict = {item['base_nome']: item['url_link'] for item in links_res.data}
+        except Exception:
+            st.warning("⚠️ Tabela 'config_links' não encontrada no Supabase.")
 
     if escolha == "📊 Simulador":
-        st.title("📊 Simulador de Preços (v5.1)")
+        st.title("📊 Simulador de Margem EBITDA")
         
         # Monitor de Transmissão Plena
         with st.status("📡 Sincronizando com OneDrive...", expanded=False) as status:
@@ -78,18 +87,34 @@ else:
             df_inv, s2 = load_excel_base(links_dict.get('Inventário'))
             df_frete, s3 = load_excel_base(links_dict.get('Frete'))
             if s1 and s2 and s3:
-                status.update(label="✅ Acesso Pleno aos Dados", state="complete")
+                status.update(label="✅ Conexão Plena: Dados Atualizados", state="complete")
             else:
-                status.update(label="⚠️ Falha na Transmissão de Bases", state="error")
+                status.update(label="⚠️ Transmissão Parcial: Verifique os links", state="error")
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            sku_lista = df_precos['SKU'].unique() if not df_precos.empty else ["Aguardando Base..."]
-            sku_sel = st.selectbox("Selecione o SKU", sku_lista)
-            uf_sel = st.selectbox("UF de Destino", ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"])
+            sku_list = df_precos['SKU'].unique() if not df_precos.empty else ["Aguardando Dados..."]
+            sku_sel = st.selectbox("SKU", sku_list)
+            uf_sel = st.selectbox("UF Destino", ["SP", "RJ", "MG", "ES", "BA", "PR", "SC", "RS"])
 
         with col2:
-            c_base = 0.0
+            custo_v = 0.0
             if not df_inv.empty and sku_sel in df_inv['SKU'].values:
-                c_base = float(df_inv.loc[df_inv['SKU'] == sku_sel, 'Custo'].values[0])
-            st.number_input("
+                custo_v = float(df_inv.loc[df_inv['SKU'] == sku_sel, 'Custo'].values[0])
+            st.number_input("Custo Inventário (R$)", value=custo_v, disabled=True)
+            
+            frete_v = 0.0
+            if not df_frete.empty and uf_sel in df_frete['UF'].values:
+                frete_v = float(df_frete.loc[df_frete['UF'] == uf_sel, 'Valor'].values[0])
+            f_input = st.number_input("Frete por UF", value=frete_v)
+
+        with col3:
+            # Componentes v5.1
+            tributos, dev, comiss, bonif, mc_alvo = 0.15, 0.03, 0.03, 0.01, 0.09
+            mod, overhead = 0.01, 0.16
+            
+            # Cálculo de Markup (Resolvendo NameError da linha 105)
+            soma_perc_sobre_receita = tributos + dev + comiss + bonif + mc_alvo
+            custo_total_operacional = (custo_v * (1 + mod)) + f_input
+            
+            preco_calc = custo_
