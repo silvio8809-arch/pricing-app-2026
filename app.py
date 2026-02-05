@@ -4,7 +4,7 @@ import pandas as pd
 import re
 
 # --- 1. CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Pricing Estratégico 2026 - v2.5.0", layout="wide")
+st.set_page_config(page_title="Pricing Estratégico 2026 - v2.5.1", layout="wide")
 
 # --- 2. CONEXÃO COM O SUPABASE ---
 def init_connection():
@@ -64,7 +64,7 @@ else:
         st.session_state.update({'autenticado': False})
         st.rerun()
 
-    # Carregar Links das Bases salvos no Supabase
+    # Carregar Links das Bases do Supabase
     links_res = supabase.table("config_links").select("*").execute()
     links_dict = {item['base_nome']: item['url_link'] for item in links_res.data}
 
@@ -96,13 +96,13 @@ else:
             frete_final = st.number_input("Frete por UF", value=frete_uf)
 
         with col3:
-            # PARÂMETROS DO MANUAL 5.1
+            # Parâmetros Oficiais
             tributos, devolucao, comissao, bonificacao = 0.15, 0.03, 0.03, 0.01
             mod_tax, mc_alvo, overhead = 0.01, 0.09, 0.16
 
             soma_perc_sobre_receita = tributos + devolucao + comissao + bonificacao + mc_alvo
             custo_operacional_total = (custo_base * (1 + mod_tax)) + frete_final
-            preco_calc = custo_operacional_total / (1 - soma_perc_sobre_receita) if soma_perc_sobre_receita < 1 else 0
+            preco_calc = custo_operacional_total / (1 - soma_perc_receita) if soma_perc_sobre_receita < 1 else 0
             preco_final = st.number_input("Preço Sugerido (R$)", value=round(preco_calc, 2))
 
         # --- RESULTADOS ---
@@ -126,11 +126,21 @@ else:
         bases = ["Inventário", "Frete", "Bonificações", "Preços Atuais", "VPC"]
         
         for b in bases:
-            # Lógica do Indicador de Status
+            # Lógica corrigida do Indicador
             res_l = supabase.table("config_links").select("url_link").eq("base_nome", b).execute()
             u_v = res_l.data[0]['url_link'] if res_l.data else ""
-            
-            # Define o ícone e a cor baseada no conteúdo
             status_icon = "✅ Ativo" if u_v else "❌ Pendente"
             
-            with st.expander(f"{status_icon} - Configurar: {
+            with st.expander(f"{status_icon} - Configurar: {b}"):
+                n_u = st.text_input(f"Link para {b}", value=u_v, key=b)
+                if st.button(f"Salvar Link {b}"):
+                    f_l = universal_onedrive_fixer(n_u)
+                    supabase.table("config_links").upsert({"base_nome": b, "url_link": f_l}).execute()
+                    st.success(f"Link de {b} atualizado!")
+                    st.rerun()
+
+    # --- TELA: USUÁRIOS ---
+    elif escolha == "👤 Usuários":
+        st.title("👤 Usuários Cadastrados")
+        u_data = supabase.table("usuarios").select("email, perfil").execute()
+        st.table(pd.DataFrame(u_data.data))
