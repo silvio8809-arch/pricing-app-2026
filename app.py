@@ -4,7 +4,7 @@ import pandas as pd
 import re
 
 # --- 1. CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Pricing Estratégico 2026 - v2.5.1", layout="wide")
+st.set_page_config(page_title="Pricing Estratégico 2026 - v2.5.2", layout="wide")
 
 # --- 2. CONEXÃO COM O SUPABASE ---
 def init_connection():
@@ -34,7 +34,7 @@ def load_excel_base(url):
     try:
         if not url: return pd.DataFrame()
         return pd.read_excel(url)
-    except:
+    except Exception as e:
         return pd.DataFrame()
 
 # --- 4. SISTEMA DE LOGIN ---
@@ -64,7 +64,7 @@ else:
         st.session_state.update({'autenticado': False})
         st.rerun()
 
-    # Carregar Links das Bases do Supabase
+    # Carregar Links das Bases salvos no Supabase
     links_res = supabase.table("config_links").select("*").execute()
     links_dict = {item['base_nome']: item['url_link'] for item in links_res.data}
 
@@ -96,13 +96,16 @@ else:
             frete_final = st.number_input("Frete por UF", value=frete_uf)
 
         with col3:
-            # Parâmetros Oficiais
+            # PARÂMETROS DO MANUAL 5.1
             tributos, devolucao, comissao, bonificacao = 0.15, 0.03, 0.03, 0.01
             mod_tax, mc_alvo, overhead = 0.01, 0.09, 0.16
 
+            # SOMA CORRIGIDA: soma_perc_sobre_receita
             soma_perc_sobre_receita = tributos + devolucao + comissao + bonificacao + mc_alvo
             custo_operacional_total = (custo_base * (1 + mod_tax)) + frete_final
-            preco_calc = custo_operacional_total / (1 - soma_perc_receita) if soma_perc_sobre_receita < 1 else 0
+            
+            # FÓRMULA CORRIGIDA: preco_calc usando a variável correta
+            preco_calc = custo_operacional_total / (1 - soma_perc_sobre_receita) if soma_perc_sobre_receita < 1 else 0
             preco_final = st.number_input("Preço Sugerido (R$)", value=round(preco_calc, 2))
 
         # --- RESULTADOS ---
@@ -122,11 +125,8 @@ else:
     # --- TELA: CONFIGURAÇÕES MASTER ---
     elif escolha == "⚙️ Configurações Master":
         st.title("⚙️ Gestão de Planilhas OneDrive")
-        
         bases = ["Inventário", "Frete", "Bonificações", "Preços Atuais", "VPC"]
-        
         for b in bases:
-            # Lógica corrigida do Indicador
             res_l = supabase.table("config_links").select("url_link").eq("base_nome", b).execute()
             u_v = res_l.data[0]['url_link'] if res_l.data else ""
             status_icon = "✅ Ativo" if u_v else "❌ Pendente"
