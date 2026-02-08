@@ -4,4 +4,3 @@ plotly
 supabase
 openpyxl
 requests
-
