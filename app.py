@@ -23,7 +23,6 @@ class Config:
                   "MG", "MS", "MT", "PA", "PB", "PE", "PI", "PR", "RJ", "RN", 
                   "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
     
-    # Parâmetros Manual v5.1
     TRIBUTOS = 0.15
     DEVOLUCAO = 0.03
     COMISSAO = 0.03
@@ -36,14 +35,12 @@ def tratar_link_nuvem(url: str) -> str:
     if not url: return url
     url = url.strip()
 
-    # PADRÃO GOOGLE DRIVE
     if 'drive.google.com' in url:
         match = re.search(r"/d/([^/]+)", url)
         if match:
             file_id = match.group(1)
             return f"https://drive.google.com/uc?export=download&id={file_id}"
     
-    # PADRÃO MICROSOFT (SharePoint/OneDrive)
     elif 'sharepoint.com' in url or '1drv.ms' in url:
         if 'download=1' in url: return url
         separator = '&' if '?' in url else '?'
@@ -59,7 +56,6 @@ def init_connection():
         key = st.secrets["SUPABASE_KEY"]
         return create_client(url, key)
     except:
-        st.error("❌ Erro nas credenciais do Supabase")
         return None
 
 def carregar_links(supabase) -> Dict[str, str]:
@@ -107,7 +103,9 @@ def main():
     if 'auth' not in st.session_state: st.session_state.auth = False
     
     supabase = init_connection()
-    if not supabase: return
+    if not supabase: 
+        st.error("Erro de conexão com Supabase.")
+        return
 
     if not st.session_state.auth:
         st.title("🔐 Login Pricing 2026")
@@ -124,12 +122,12 @@ def main():
                     st.error("Usuário ou senha inválidos")
         return
 
-    # Menu Lateral
     with st.sidebar:
         st.write(f"👤 **{st.session_state.user.get('nome')}**")
         st.caption(f"Perfil: {st.session_state.user.get('perfil')}")
         
         opcoes = ["📊 Simulador"]
+        # VERIFICAÇÃO CRÍTICA DO PERFIL MASTER
         if st.session_state.user.get('perfil') == 'Master':
             opcoes.append("⚙️ Configurações")
         
@@ -142,13 +140,12 @@ def main():
 
     if menu == "📊 Simulador":
         st.title("📊 Simulador de Margem EBITDA")
-        
         df_precos, ok1, _ = load_excel_base(links.get('Preços Atuais', ''))
         df_inv, ok2, _ = load_excel_base(links.get('Inventário', ''))
         df_frete, ok3, _ = load_excel_base(links.get('Frete', ''))
 
         if not (ok1 and ok2 and ok3):
-            st.warning("⚠️ Transmissão Parcial: Verifique links em Configurações")
+            st.warning("⚠️ Verifique os links em Configurações")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -177,7 +174,7 @@ def main():
             c3.metric("Custo Total", f"R$ {res['c_total']:.2f}")
 
     elif menu == "⚙️ Configurações":
-        st.title("⚙️ Configuração de Bases (GDrive / OneDrive)")
+        st.title("⚙️ Configuração de Bases")
         for base in ["Preços Atuais", "Inventário", "Frete", "VPC por cliente"]:
             with st.expander(f"Configurar: {base}"):
                 url_atual = links.get(base, "")
