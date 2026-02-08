@@ -1,93 +1,89 @@
 import streamlit as st
 from supabase import create_client
 import pandas as pd
-import re
 
-# ==================== VERSÃO 3.3.8 ====================
-__version__ = "3.3.8"
-
-st.set_page_config(page_title="Pricing 2026", page_icon="💰", layout="wide")
+# VERSÃO 3.4.1 - ESTABILIZADA
+st.set_page_config(page_title="Pricing 2026", layout="wide")
 
 @st.cache_resource
 def init_connection():
     try:
+        # Puxa os segredos que acabamos de validar no Passo 1
         u = st.secrets["SUPABASE_URL"]
         k = st.secrets["SUPABASE_KEY"]
         return create_client(u, k)
-    except:
+    except Exception as e:
         return None
-
-def tratar_link(url):
-    if not url: return ""
-    url = url.strip()
-    if 'drive.google.com' in url:
-        m = re.search(r"/d/([^/]+)", url)
-        if m: return "https://drive.google.com/uc?export=download&id=" + m.group(1)
-    elif 'sharepoint.com' in url or '1drv.ms' in url:
-        s = '&' if '?' in url else '?'
-        if 'download=1' not in url: return url + s + "download=1"
-    return url
 
 supabase = init_connection()
 
 if 'auth' not in st.session_state:
     st.session_state.auth = False
 
-# TELA DE LOGIN
+# --- TELA DE LOGIN ---
 if not st.session_state.auth:
-    st.title("🔐 Login Pricing 2026")
-    with st.form("login_form"):
-        u_email = st.text_input("E-mail")
-        u_pass = st.text_input("Senha", type="password")
+    st.title("🔐 Login Pricing")
+    with st.form("login"):
+        u = st.text_input("E-mail")
+        p = st.text_input("Senha", type="password")
         if st.form_submit_button("Entrar"):
             if not supabase:
-                st.error("Erro nas chaves dos Secrets.")
+                st.error("Erro de conexão com o banco. Verifique os Secrets.")
             else:
                 try:
-                    res = supabase.table("usuarios").select("*").eq("email", u_email).eq("senha", u_pass).execute()
+                    res = supabase.table("usuarios").select("*").eq("email", u).eq("senha", p).execute()
                     if res.data:
                         st.session_state.auth = True
                         st.session_state.user = res.data[0]
                         st.rerun()
                     else:
-                        st.error("Usuário ou senha inválidos.")
+                        st.error("E-mail ou senha não encontrados.")
                 except:
-                    st.error("Erro de conexão com o banco de dados.")
+                    st.error("Erro ao consultar banco de dados.")
     st.stop()
 
-# INTERFACE PRINCIPAL
+# --- INTERFACE PRINCIPAL ---
 with st.sidebar:
-    st.write("👤 **" + str(st.session_state.user.get('nome', 'Usuário')) + "**")
+    # Mostra o nome e perfil do usuário logado
+    nome = str(st.session_state.user.get('nome', 'Usuário'))
+    st.write("👤 **" + nome + "**")
+    
+    # Validação de Perfil (Converte para maiúsculas para evitar erros)
     p_raw = st.session_state.user.get('perfil', 'Vendedor')
-    p_limpo = str(p_raw).upper()
-    st.caption("Perfil: " + p_limpo)
+    perf = str(p_raw).upper()
+    st.caption("Perfil: " + perf)
     
     opcoes = ["📊 Simulador"]
-    # Liberação para ADMIN ou MASTER
-    if p_limpo in ['MASTER', 'ADMIN', 'ADM']:
+    # LIBERAÇÃO: Se for ADMIN, ADM ou MASTER, mostra a engrenagem
+    if perf in ['ADMIN', 'ADM', 'MASTER']:
         opcoes.append("⚙️ Configurações")
     
     menu = st.radio("Menu", opcoes)
-    if st.button("🚪 Sair"):
+    
+    if st.button("Sair"):
         st.session_state.auth = False
         st.rerun()
 
+# --- LÓGICA DAS PÁGINAS ---
 if menu == "⚙️ Configurações":
     st.title("⚙️ Configurações de Bases")
+    st.success("Acesso Master/Admin liberado!")
+    
     bases = ["Preços Atuais", "Inventário", "Frete", "VPC por cliente"]
     for b in bases:
-        with st.expander("Base: " + b):
-            l_atual = ""
+        with st.expander("Configurar link: " + b):
+            # Busca link atual no Supabase
+            link_atual = ""
             try:
-                r = supabase.table("config_links").select("url_link").eq("base_nome", b).execute()
-                if r.data: l_atual = r.data[0]['url_link']
+                res_l = supabase.table("config_links").select("url_link").eq("base_nome", b).execute()
+                if res_l.data: link_atual = res_l.data[0]['url_link']
             except: pass
             
-            n_link = st.text_input("Link para " + b, value=l_atual, key="k_" + b)
+            novo_l = st.text_input("Cole o link aqui", value=link_atual, key="k_"+b)
             if st.button("Salvar " + b):
-                supabase.table("config_links").upsert({"base_nome": b, "url_link": n_link}).execute()
-                st.success("Salvo!")
-                st.cache_data.clear()
+                supabase.table("config_links").upsert({"base_nome": b, "url_link": novo_l}).execute()
+                st.info("Link de " + b + " atualizado no banco!")
+
 else:
     st.title("📊 Simulador de Margem")
-    st.info("Acesse Configurações para carregar seus arquivos.")
+    st.info("Utilize o menu lateral para gerenciar os dados ou realizar simulações.")
