@@ -1,5 +1,4 @@
-streamlit
-pandas
-supabase
-openpyxl
-requests
+streamlit>=1.32.0
+supabase>=2.4.0
+pandas>=2.2.0
+openpyxl>=3.1.2
