@@ -465,4 +465,389 @@ def get_custo_inventario(df_inv: pd.DataFrame, sku: str) -> Optional[float]:
         return None
     linha = df_inv[df_inv[col_sku].astype(str) == str(sku)]
     if linha.empty:
-        return Non
+        return None
+    try:
+        return float(linha[col_custo].values[0])
+    except Exception:
+        return None
+
+
+def get_frete_uf(df_frete: pd.DataFrame, uf: str) -> float:
+    if df_frete.empty:
+        return 0.0
+    col_uf = pick_col(df_frete, ["UF", "Estado", "Destino"])
+    col_val = pick_col(df_frete, ["Valor", "Frete", "Custo Frete", "Custo", "Valor Frete"])
+    if not col_uf or not col_val:
+        return 0.0
+    linha = df_frete[df_frete[col_uf].astype(str).str.upper() == str(uf).upper()]
+    if linha.empty:
+        return 0.0
+    try:
+        return float(linha[col_val].values[0])
+    except Exception:
+        return 0.0
+
+
+def get_vpc_cliente(df_vpc: pd.DataFrame, cliente: str, sku: Optional[str] = None) -> float:
+    if df_vpc.empty:
+        return 0.0
+    col_cliente = pick_col(df_vpc, ["Cliente", "CNPJ", "Razão Social", "Razao Social", "Cliente Nome", "Nome"])
+    col_vpc = pick_col(df_vpc, ["VPC", "VPC%", "VPC %", "Percentual", "Perc", "Desconto", "Desconto%"])
+    col_sku = pick_col(df_vpc, ["SKU", "codigo", "código", "cod", "cód"])
+    if not col_cliente or not col_vpc:
+        return 0.0
+
+    base = df_vpc[df_vpc[col_cliente].astype(str) == str(cliente)]
+    if sku and col_sku and not base.empty:
+        base_sku = base[base[col_sku].astype(str) == str(sku)]
+        if not base_sku.empty:
+            base = base_sku
+
+    if base.empty:
+        return 0.0
+
+    try:
+        v = float(base[col_vpc].values[0])
+        if v > 1.0:
+            v = v / 100.0
+        return max(0.0, min(v, 0.90))
+    except Exception:
+        return 0.0
+
+
+def listar_clientes(df_vpc: pd.DataFrame) -> List[str]:
+    if df_vpc.empty:
+        return []
+    col_cliente = pick_col(df_vpc, ["Cliente", "CNPJ", "Razão Social", "Razao Social", "Cliente Nome", "Nome"])
+    if not col_cliente:
+        return []
+    vals = sorted(df_vpc[col_cliente].astype(str).dropna().unique().tolist())
+    return [v for v in vals if v.strip()]
+
+
+# ==================== TELAS ====================
+def inicializar_sessao():
+    defaults = {"autenticado": False, "perfil": Config.PERFIL_VENDEDOR, "email": "", "nome": "Usuário"}
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def tela_login(supabase):
+    st.title("🔐 Login - Pricing Corporativo")
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("login_form"):
+            st.markdown("### Acesse sua conta")
+            email = st.text_input("📧 E-mail")
+            senha = st.text_input("🔑 Senha", type="password")
+            btn = st.form_submit_button("Entrar", use_container_width=True)
+            if btn:
+                if not email or not senha:
+                    st.error("⚠️ Preencha todos os campos")
+                    return
+                ok, dados = autenticar_usuario(supabase, email, senha)
+                if ok:
+                    st.session_state.update({"autenticado": True, "perfil": dados["perfil"], "email": dados["email"], "nome": dados["nome"]})
+                    st.success("✅ Login realizado!")
+                    st.rerun()
+                else:
+                    st.error("❌ E-mail ou senha incorretos")
+
+
+def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
+    st.title("🔎 Consulta de Preços + Margens (MC / EBITDA)")
+
+    with st.spinner("Carregando bases..."):
+        df_precos, ok_p, msg_p = load_excel_base(links.get("Preços Atuais", ""))
+        df_inv, ok_i, msg_i = load_excel_base(links.get("Inventário", ""))
+        df_frete, ok_f, msg_f = load_excel_base(links.get("Frete", ""))
+        df_vpc, ok_v, msg_v = load_excel_base(links.get("VPC por cliente", ""))
+
+    status = {
+        "Preços Atuais": (ok_p, msg_p),
+        "Inventário": (ok_i, msg_i),
+        "Frete": (ok_f, msg_f),
+        "VPC por cliente": (ok_v, msg_v),
+    }
+
+    falhas = [n for n, (ok, _) in status.items() if not ok]
+    with st.expander("📌 Status das Bases", expanded=bool(falhas)):
+        c = st.columns(2)
+        for idx, (nome, (ok, msg)) in enumerate(status.items()):
+            with c[idx % 2]:
+                if ok:
+                    st.success("✅ " + nome)
+                else:
+                    st.error("❌ " + nome)
+                    st.caption(msg)
+
+    if falhas:
+        st.error("⚠️ Não é possível consultar enquanto houver base indisponível: " + ", ".join(falhas))
+        if is_admin():
+            st.info("💡 Vá em **⚙️ Configurações** para corrigir links e/ou parâmetros.")
+        return
+
+    col_sku_precos = pick_col(df_precos, ["SKU", "codigo", "código", "cod", "cód"])
+    if not col_sku_precos:
+        st.error("❌ Base 'Preços Atuais' sem coluna SKU (ou equivalente). Padronize a coluna como 'SKU'.")
+        return
+
+    skus = sorted(df_precos[col_sku_precos].astype(str).dropna().unique().tolist())
+    skus = [s for s in skus if s.strip()]
+
+    st.divider()
+    st.subheader("📌 Parâmetros de consulta")
+
+    col_a, col_b, col_c = st.columns([2, 2, 2])
+
+    with col_a:
+        sku = st.selectbox("SKU", options=["Selecione..."] + skus)
+
+    with col_b:
+        modo = st.radio("Base de destino", options=["UF destino", "Cliente"], horizontal=True)
+
+    with col_c:
+        uf = None
+        cliente = None
+
+        if modo == "UF destino":
+            uf = st.selectbox("UF destino", options=Config.UFS_BRASIL)
+        else:
+            clientes = listar_clientes(df_vpc)
+            if clientes:
+                cliente = st.selectbox("Cliente", options=["Selecione..."] + clientes)
+            else:
+                st.warning("⚠️ Base 'VPC por cliente' não possui coluna Cliente (ou está vazia).")
+                cliente = "Selecione..."
+
+            uf = st.selectbox("UF destino (fallback)", options=Config.UFS_BRASIL)
+
+    if sku == "Selecione...":
+        st.info("💡 Selecione um SKU para consultar.")
+        return
+
+    preco_atual = get_price_from_df_precos(df_precos, sku)
+    custo_inv = get_custo_inventario(df_inv, sku)
+    desc = get_desc_from_df_precos(df_precos, sku)
+
+    if preco_atual is None:
+        st.error("❌ Não foi possível localizar a coluna de preço na base 'Preços Atuais'. Padronize como 'Preço' ou 'Preço Atual'.")
+        return
+
+    if custo_inv is None:
+        st.error("❌ Não foi possível localizar 'Custo Inventário' (ou equivalente) na base 'Inventário'. Padronize como 'Custo Inventário'.")
+        return
+
+    frete_uf = get_frete_uf(df_frete, uf or "")
+    vpc_pct = 0.0
+    aplicar_vpc = False
+
+    if modo == "Cliente" and cliente and cliente != "Selecione...":
+        vpc_pct = get_vpc_cliente(df_vpc, cliente, sku=sku)
+        aplicar_vpc = st.toggle("Aplicar VPC", value=(vpc_pct > 0))
+        st.caption("VPC previsto para o cliente: " + (formatar_pct(vpc_pct) if vpc_pct > 0 else "0,00%"))
+
+    res = CalculadoraAMVOX.calcular(
+        preco_bruto=preco_atual,
+        custo_inventario=custo_inv,
+        frete_uf=frete_uf,
+        params=params,
+        aplicar_vpc=aplicar_vpc,
+        vpc_pct=vpc_pct,
+    )
+
+    st.divider()
+    st.subheader("📊 Resultado (Preço + Margens)")
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Preço (Base Preços Atuais)", formatar_moeda(res["preco_bruto"]))
+        if desc:
+            st.caption("Descrição: " + desc[:120])
+    with m2:
+        st.metric("Receita Base (pós VPC)", formatar_moeda(res["receita_base"]))
+    with m3:
+        st.metric("Margem de Contribuição", formatar_moeda(res["mc_val"]), formatar_pct(res["mc_pct"]))
+    with m4:
+        st.metric("EBITDA", formatar_moeda(res["ebitda_val"]), formatar_pct(res["ebitda_pct"]))
+
+    mc_alvo = float(params.get("MC_ALVO", 0.16))
+    st.divider()
+    if res["mc_pct"] < mc_alvo:
+        st.warning("⚠️ MC abaixo do alvo: " + formatar_pct(res["mc_pct"]) + " < " + formatar_pct(mc_alvo))
+    else:
+        st.success("✅ MC dentro do alvo: " + formatar_pct(res["mc_pct"]) + " ≥ " + formatar_pct(mc_alvo))
+
+    with st.expander("🧾 Detalhamento técnico (custos e componentes)"):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**Receita**")
+            st.write("- Preço bruto: " + formatar_moeda(res["preco_bruto"]))
+            st.write("- VPC aplicado: " + formatar_pct(res["vpc_pct"]))
+            st.write("- Receita base: " + formatar_moeda(res["receita_base"]))
+            st.write("- Receita líquida (pós tributos): " + formatar_moeda(res["receita_liquida"]))
+        with c2:
+            st.write("**Custos Variáveis**")
+            st.write("- Custo inventário: " + formatar_moeda(res["custo_inventario"]))
+            st.write("- MOD (sobre custo): " + formatar_moeda(res["custo_mod"]))
+            st.write("- Bonificação (sobre custo): " + formatar_moeda(res["custo_bonificacao"]))
+            st.write("- Frete UF: " + formatar_moeda(res["frete_uf"]))
+            st.write("- Devolução (sobre receita): " + formatar_moeda(res["custo_devolucao"]))
+            st.write("- Comissão (sobre receita): " + formatar_moeda(res["custo_comissao"]))
+            st.write("- **Total custos variáveis:** " + formatar_moeda(res["custos_variaveis"]))
+            st.divider()
+            st.write("**Overhead (fixo)**")
+            st.write("- Overhead: " + formatar_moeda(res["overhead_val"]))
+
+
+def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]):
+    st.title("⚙️ Configurações (ADM/Master)")
+    if not is_admin():
+        st.warning("⚠️ Acesso restrito a usuários ADM/Master")
+        return
+
+    tab1, tab2 = st.tabs(["🔗 Links das Bases", "🧩 Parâmetros de Precificação"])
+
+    with tab1:
+        st.info("Cole links do OneDrive/SharePoint ou Google Drive/Sheets. Os arquivos precisam estar públicos via link (Leitor).")
+        bases = ["Preços Atuais", "Inventário", "Frete", "VPC por cliente"]
+
+        for base in bases:
+            url_salva = links.get(base, "")
+            with st.expander("📊 " + base, expanded=True):
+                link = st.text_area("Link da planilha", value=url_salva, key="link_" + base, height=110)
+
+                if link and link.strip():
+                    link_limpo = link.strip()
+                    plataforma = identificar_plataforma_link(link_limpo)
+                    st.caption("Plataforma detectada: " + plataforma)
+
+                    urls, ok_conv, msg_conv, _plat = converter_link_para_download(link_limpo)
+                    if ok_conv and urls:
+                        st.caption("Link(s) de download gerado(s):")
+                        for u in urls:
+                            st.code(u)
+                    else:
+                        st.warning(msg_conv)
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        if st.button("🧪 Validar link", key="val_" + base, use_container_width=True):
+                            with st.spinner("Testando..."):
+                                _, okv, msgv = testar_link_tempo_real(link_limpo)
+                            if okv:
+                                st.success("✅ Link válido")
+                            else:
+                                st.error("❌ Link com erro")
+                                st.warning(msgv)
+
+                    with col_b:
+                        if st.button("💾 Salvar", key="save_" + base, type="primary", use_container_width=True):
+                            ok_save, msg_save = salvar_link_config(supabase, base, link_limpo)
+                            if ok_save:
+                                st.success("✅ " + base + " salvo com sucesso!")
+                                st.cache_data.clear()
+                                st.rerun()
+                            else:
+                                st.error("❌ Erro ao salvar: " + msg_save)
+                else:
+                    st.warning("⚠️ Nenhum link configurado para esta base")
+
+    with tab2:
+        st.info("Parâmetros que intervêm no preço. Preenchimento manual, governado por ADM/Master.")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            trib = st.number_input("Tributos sobre vendas (%)", 0.0, 100.0, float(params.get("TRIBUTOS", 0.15) * 100), 0.1)
+            devol = st.number_input("Devoluções históricas (%)", 0.0, 100.0, float(params.get("DEVOLUCAO", 0.03) * 100), 0.1)
+            comis = st.number_input("Comissão de vendas (%)", 0.0, 100.0, float(params.get("COMISSAO", 0.03) * 100), 0.1)
+        with col2:
+            bon = st.number_input("Bonificações (% sobre custo)", 0.0, 100.0, float(params.get("BONIFICACAO_CUSTO", 0.01) * 100), 0.1)
+            mod = st.number_input("MOD (% sobre custo)", 0.0, 100.0, float(params.get("MOD_CUSTO", 0.01) * 100), 0.1)
+            overhead = st.number_input("Overhead corporativo (%)", 0.0, 100.0, float(params.get("OVERHEAD", 0.16) * 100), 0.1)
+        with col3:
+            mc_alvo = st.number_input("Margem de Contribuição alvo (%)", 0.0, 100.0, float(params.get("MC_ALVO", 0.16) * 100), 0.1)
+
+        st.divider()
+        if st.button("💾 Salvar Parâmetros", type="primary", use_container_width=True):
+            itens = {
+                "TRIBUTOS": trib / 100.0,
+                "DEVOLUCAO": devol / 100.0,
+                "COMISSAO": comis / 100.0,
+                "BONIFICACAO_CUSTO": bon / 100.0,
+                "MOD_CUSTO": mod / 100.0,
+                "OVERHEAD": overhead / 100.0,
+                "MC_ALVO": mc_alvo / 100.0,
+            }
+
+            falhas = []
+            for nome, val in itens.items():
+                ok, msg = salvar_parametro(supabase, nome, val, grupo="PRECIFICACAO")
+                if not ok:
+                    falhas.append(nome + ": " + msg)
+
+            if falhas:
+                st.error("❌ Não foi possível persistir todos os parâmetros no Supabase.")
+                st.warning("Detalhes:\n- " + "\n- ".join(falhas))
+                st.info("💡 Ação: confirme se existe a tabela config_parametros com colunas (nome_parametro, valor_percentual, grupo).")
+            else:
+                st.success("✅ Parâmetros salvos com sucesso!")
+                st.cache_data.clear()
+                st.rerun()
+
+
+def tela_sobre(params: Dict[str, float]):
+    st.title("ℹ️ Sobre o Sistema")
+    st.write("Versão: " + __version__ + " | " + __release_date__)
+    st.write("Últimas alterações:")
+    for c in __last_changes__:
+        st.write("- " + c)
+
+    with st.expander("📌 Parâmetros vigentes (snapshot)"):
+        for k in sorted(params.keys()):
+            st.write(f"- {k}: {formatar_pct(params[k])}")
+
+
+# ==================== APP PRINCIPAL ====================
+def main():
+    inicializar_sessao()
+    supabase = init_connection()
+
+    if not st.session_state["autenticado"]:
+        tela_login(supabase)
+        return
+
+    links = carregar_links(supabase)          # supabase é ignorado no hash por causa do _supabase
+    params = carregar_parametros(supabase)    # supabase é ignorado no hash por causa do _supabase
+
+    with st.sidebar:
+        st.title("👤 " + str(st.session_state.get("nome")))
+        st.caption("🎭 " + str(st.session_state.get("perfil")))
+        st.divider()
+
+        opcoes = ["🔎 Consulta de Preços", "ℹ️ Sobre"]
+        if is_admin():
+            opcoes.insert(1, "⚙️ Configurações")
+
+        menu = st.radio("📍 Menu", opcoes, label_visibility="collapsed")
+
+        st.divider()
+        if st.button("🚪 Sair", use_container_width=True):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
+
+        st.divider()
+        st.caption("v" + __version__ + " | " + __release_date__)
+
+    if menu == "🔎 Consulta de Preços":
+        tela_consulta_precos(links, params)
+    elif menu == "⚙️ Configurações":
+        tela_configuracoes(supabase, links, params)
+    else:
+        tela_sobre(params)
+
+
+if __name__ == "__main__":
+    main()
