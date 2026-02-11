@@ -7,9 +7,9 @@ from __future__ import annotations
 import re
 import socket
 import unicodedata
-from datetime import datetime
+from datetime import datetime, date
 from io import BytesIO
-from typing import Tuple, Dict, Optional, List
+from typing import Tuple, Dict, Optional, List, Any
 from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
@@ -19,14 +19,14 @@ import requests
 
 # ==================== VERSÃO (LEAN) ====================
 APP_NAME = "Pricing 2026"
-__version__ = "3.6.0"
+__version__ = "3.8.0"
 __release_date__ = "2026-02-10"
 __last_changes__ = [
-    "Consulta agora CALCULA automaticamente o Preço Sugerido (Sem IPI) pela fórmula oficial (gross-up)",
-    "Consulta exibe: Preço Sugerido + MC + EBITDA (Preço Atual vira apenas referência)",
-    "Parâmetros do gross-up editáveis por ADM/Master (inclui Frete% por UF e IPI opcional)",
-    "Correção Streamlit: removido cache em funções com objeto Supabase (evita UnhashableParamError)",
-    "Descrição prioriza PROD (SKU + descrição concatenados) quando existir",
+    "Nova aba: Dashboard com filtros (Cliente / SKU / Período) e KPIs",
+    "IPI por SKU calculado automaticamente via Preço Atual c/ IPI vs s/ IPI",
+    "IPI aplicado em todas as telas (consulta e pedido) sem parâmetro manual",
+    "Telemetria: grava log_simulacoes (se tabela existir) para analytics",
+    "Performance: lookups em memória (SKU->IPI%, preços, cliente x sku) e cache TTL",
 ]
 
 # ==================== CONFIGURAÇÃO INICIAL ====================
@@ -52,16 +52,14 @@ class Config:
         "AP", "TO", "PI", "RN", "PB", "AL", "SE",
     ]
 
-    # Defaults alinhados com sua política (podem ser alterados pela tela Configurações)
     DEFAULT_PARAMS = {
-        "TRIBUTOS": 0.15,        # base receita
-        "DEVOLUCAO": 0.03,       # base receita
-        "COMISSAO": 0.03,        # base receita
-        "BONIFICACAO": 0.01,     # base receita (somatório do gross-up)
-        "MC_ALVO": 0.09,         # margem alvo (gross-up)
-        "MOD": 0.01,             # base custo (CPV)
-        "OVERHEAD": 0.16,        # fora do preço (impacta EBITDA)
-        "IPI": 0.00,             # opcional (se precisar exibir preço com IPI)
+        "TRIBUTOS": 0.15,
+        "DEVOLUCAO": 0.03,
+        "COMISSAO": 0.03,
+        "BONIFICACAO": 0.01,
+        "MC_ALVO": 0.09,
+        "MOD": 0.01,
+        "OVERHEAD": 0.16,
     }
 
 
@@ -110,25 +108,20 @@ def normalizar_texto(s: object) -> str:
 # ==================== DE→PARA (Governança de Dados) ====================
 DEPARA_COLUNAS: Dict[str, List[str]] = {
     "SKU": ["SKU", "Produto", "CODPRO", "CodPro", "Código do Produto", "Codigo do Produto", "Codigo", "Código", "COD", "Cód"],
-    # PROD é prioridade de descrição (base Preços Atuais costuma trazer SKU+descrição concatenados)
-    "DESCRICAO": ["PROD", "Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto",
-                  "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto", "Produto Descrição"],
-    "PRECO": ["Preço", "Preco", "Preço Atual", "Preco Atual", "Preço Venda", "Preco Venda", "PV", "Preço Sem IPI", "Preco Sem IPI"],
+    "PROD": ["PROD", "Produto/Descrição", "Produto Descrição", "Descricao Concatenada", "SKU + Descrição", "SKU+Descrição"],
+    "DESCRICAO": ["Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto", "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto"],
     "CUSTO_INVENTARIO": ["Custo Inventário", "Custo Inventario", "Custo", "CMV", "CPV", "Custo Produto", "Custo Mercadoria"],
     "UF": ["UF", "Estado", "Destino", "UF Destino"],
-    # IMPORTANTE: Frete agora é tratado como PERCENTUAL no gross-up (frete% por UF)
     "FRETE_PCT": ["Frete%", "Frete %", "Percentual Frete", "Perc Frete", "Frete Perc", "FRETE_PCT", "FRETE %"],
     "CLIENTE": ["Cliente", "Nome", "Nome do Cliente", "Razão Social", "Razao Social", "Cliente Nome", "CNPJ"],
     "VPC": ["VPC", "VPC%", "VPC %", "Percentual", "Perc", "Desconto", "Desconto%", "VPC Perc", "VPC Percentual"],
+    "PRECO_ATUAL_SEM_IPI": ["PREÇO ATUAL S/ IPI", "PRECO ATUAL S/ IPI", "PREÇO ATUAL SEM IPI", "PRECO ATUAL SEM IPI", "PRECO_ATUAL_S_IPI", "PRECO_S_IPI", "PRECO SEM IPI", "PV SEM IPI"],
+    "PRECO_ATUAL_COM_IPI": ["PREÇO ATUAL C/ IPI", "PRECO ATUAL C/ IPI", "PREÇO ATUAL COM IPI", "PRECO ATUAL COM IPI", "PRECO_ATUAL_C_IPI", "PRECO_C_IPI", "PRECO COM IPI", "PV COM IPI"],
 }
 
 EXTRAS_SINONIMOS = {
     "SKU": ["CODPROD", "COD_PROD", "COD PROD", "CODIGO PRODUTO", "CODIGO_PRODUTO"],
-    "PRECO": ["PRECO_VENDA", "PRECO VENDA", "PRECO ATUAL", "PV SEM IPI"],
-    "CUSTO_INVENTARIO": ["CUSTO_INV", "CUSTO INV", "CUSTO MEDIO", "CUSTO MÉDIO"],
     "CLIENTE": ["NOMECLIENTE", "NOME CLIENTE"],
-    "DESCRICAO": ["PRODUTO", "PROD DESC", "PROD_DESCRICAO", "PROD DESCRICAO", "PROD DESCR"],
-    "FRETE_PCT": ["FRETE PCT", "FRETE_PERCENTUAL", "PERC_FRETE", "PERCENTUAL_FRETE"],
 }
 
 
@@ -235,6 +228,14 @@ def supabase_coluna_existe(supabase, tabela: str, coluna: str) -> bool:
         return False
 
 
+def supabase_tabela_existe(supabase, tabela: str) -> bool:
+    try:
+        supabase.table(tabela).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
 def salvar_link_config(supabase, base_nome: str, url_link: str) -> Tuple[bool, str]:
     payload = {"base_nome": base_nome, "url_link": url_link}
     if supabase_coluna_existe(supabase, "config_links", "atualizado_em"):
@@ -255,7 +256,6 @@ def salvar_parametro(supabase, nome: str, valor_percentual: float, grupo: str = 
         return False, tradutor_erro(e)
 
 
-# ✅ Sem cache aqui (evita erro unhashable com objeto Supabase)
 def carregar_links(supabase) -> Dict[str, str]:
     try:
         response = supabase.table("config_links").select("*").execute()
@@ -264,7 +264,6 @@ def carregar_links(supabase) -> Dict[str, str]:
         return {}
 
 
-# ✅ Sem cache aqui (evita erro unhashable com objeto Supabase)
 def carregar_parametros(supabase) -> Dict[str, float]:
     params = dict(Config.DEFAULT_PARAMS)
     try:
@@ -278,6 +277,22 @@ def carregar_parametros(supabase) -> Dict[str, float]:
     except Exception:
         pass
     return params
+
+
+def tentar_gravar_log(supabase, payload: Dict[str, Any]) -> None:
+    """
+    Telemetria: grava em log_simulacoes se a tabela existir.
+    Se não existir, não quebra o app.
+    """
+    try:
+        if not supabase_tabela_existe(supabase, "log_simulacoes"):
+            return
+        # timestamp padronizado
+        if "data_hora" not in payload:
+            payload["data_hora"] = datetime.now().isoformat()
+        supabase.table("log_simulacoes").insert(payload).execute()
+    except Exception:
+        return
 
 
 # ==================== LINKS (OneDrive/SharePoint + Google Drive/Sheets) ====================
@@ -358,7 +373,7 @@ def converter_link_para_download(url: str) -> Tuple[List[str], bool, str, str]:
             f"https://drive.google.com/uc?id={fid}&export=download",
         ], True, "OK", plataforma
 
-    return [], False, "Link inválido - use SharePoint/OneDrive ou Google Drive/Google Sheets", plataforma
+    return [], False, "Link inválido - use OneDrive/SharePoint ou Google Drive/Google Sheets", plataforma
 
 
 def _baixar_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]:
@@ -427,7 +442,8 @@ def autenticar_usuario(supabase, email: str, senha: str) -> Tuple[bool, Optional
         response = supabase.table("usuarios").select("*").eq("email", email).eq("senha", senha).execute()
         if response.data:
             u = response.data[0]
-            return True, {"email": u.get("email"), "perfil": u.get("perfil", Config.PERFIL_VENDEDOR), "nome": u.get("nome", "Usuário")}
+            perfil = u.get("perfil", Config.PERFIL_VENDEDOR)
+            return True, {"email": u.get("email"), "perfil": perfil, "nome": u.get("nome", "Usuário")}
         return False, None
     except Exception as e:
         st.error(tradutor_erro(e))
@@ -436,16 +452,6 @@ def autenticar_usuario(supabase, email: str, senha: str) -> Tuple[bool, Optional
 
 # ==================== MOTOR (FÓRMULA OFICIAL AMVOX) ====================
 class PrecificacaoOficialAMVOX:
-    """
-    Fórmula Oficial (Sem IPI):
-      Custo Mercadoria c/ MOD = CPV * (1 + MOD)
-      Total Custos Variáveis% = Tributos + Devoluções + Comissão + Bonificação + FreteUF% + Margem + VPC_condicional
-      Preço Sem IPI = (Custo Mercadoria c/ MOD) / (1 - Total Custos Variáveis%)
-    Observação:
-      - Overhead NÃO entra no preço (impacta EBITDA)
-      - VPC é condicional (só entra se aplicar)
-    """
-
     @staticmethod
     def calcular_preco_sugerido_sem_ipi(
         cpv: float,
@@ -462,16 +468,13 @@ class PrecificacaoOficialAMVOX:
         mod = float(params.get("MOD", 0.01))
 
         vpc_cond = float(vpc_pct or 0.0) if aplicar_vpc else 0.0
-
         custo_mod = float(cpv) * (1.0 + mod)
 
         total_cv_pct = trib + devol + comis + bon + float(frete_pct) + mc_alvo + vpc_cond
         denom = 1.0 - total_cv_pct
 
         if denom <= 0:
-            raise ValueError(
-                "Total de custos variáveis % >= 100%. Ajuste parâmetros (Tributos/Devolução/Comissão/Bonificação/Frete%/MC/VPC)."
-            )
+            raise ValueError("Total de custos variáveis % >= 100%. Ajuste parâmetros (Tributos/Devolução/Comissão/Bonificação/Frete%/MC/VPC).")
 
         preco_sem_ipi = custo_mod / denom
 
@@ -509,27 +512,20 @@ class PrecificacaoOficialAMVOX:
 
         vpc_cond = float(vpc_pct or 0.0) if aplicar_vpc else 0.0
 
-        # Base de receita após VPC (decisão comercial)
         receita_base = float(preco_sem_ipi) * (1.0 - vpc_cond)
-
-        # Receita líquida (menos tributos)
         receita_liquida = receita_base * (1.0 - trib)
 
-        # Custos variáveis em valor (base receita)
         custo_devol = receita_base * devol
         custo_comis = receita_base * comis
         custo_bon = receita_base * bon
         custo_frete = receita_base * float(frete_pct)
 
-        # Custo mercadoria c/ MOD (base custo)
         custo_mod = float(cpv) * (1.0 + mod)
 
-        # Margem de Contribuição (líquida - variáveis)
         custos_variaveis_val = custo_mod + custo_devol + custo_comis + custo_bon + custo_frete
         mc_val = receita_liquida - custos_variaveis_val
         mc_pct = (mc_val / receita_base) if receita_base > 0 else 0.0
 
-        # EBITDA = MC - custos fixos (overhead)
         overhead_val = receita_base * overhead
         ebitda_val = mc_val - overhead_val
         ebitda_pct = (ebitda_val / receita_base) if receita_base > 0 else 0.0
@@ -553,137 +549,274 @@ class PrecificacaoOficialAMVOX:
         }
 
 
-# ==================== CONSULTAS (SKU/Descrição) ====================
-def get_price_from_df_precos(df_precos: pd.DataFrame, sku: str) -> Optional[float]:
-    col_sku = pick_col(df_precos, ["SKU"])
-    col_preco = pick_col(df_precos, ["PRECO"])
-    if not col_sku or not col_preco:
-        return None
-    linha = df_precos[df_precos[col_sku].astype(str) == str(sku)]
-    if linha.empty:
-        return None
+# ==================== LOOKUPS (performance) ====================
+def extrair_sku_de_prod(prod: str) -> str:
+    p = normalizar_texto(prod)
+    if not p:
+        return ""
+    m = re.match(r"^([A-Za-z0-9_-]+)", p)
+    return m.group(1) if m else ""
+
+
+def calc_ipi_pct(preco_s: Optional[float], preco_c: Optional[float]) -> float:
+    """
+    IPI% = (Preço c/ IPI / Preço s/ IPI) - 1
+    Guardrails: se faltar dado ou inválido, retorna 0.
+    """
     try:
-        return float(linha[col_preco].values[0])
+        if preco_s is None or preco_c is None:
+            return 0.0
+        ps = float(preco_s)
+        pc = float(preco_c)
+        if ps <= 0 or pc <= 0:
+            return 0.0
+        ipi = (pc / ps) - 1.0
+        if ipi < 0:
+            return 0.0
+        return min(ipi, 0.90)
     except Exception:
-        return None
+        return 0.0
 
 
-def get_desc_from_df_precos(df_precos: pd.DataFrame, sku: str) -> str:
+def build_precos_lookup(df_precos: pd.DataFrame) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "prod_list": [],
+        "prod_to_sku": {},
+        "preco_s_ipi_by_sku": {},
+        "preco_c_ipi_by_sku": {},
+        "ipi_pct_by_sku": {},
+        "cliente_sku_avg_s_ipi": {},
+        "cliente_sku_avg_c_ipi": {},
+        "cliente_sku_ipi_pct": {},
+        "has_cliente": False,
+        "clientes_list": [],
+        "skus_list": [],
+    }
+
+    if df_precos is None or df_precos.empty:
+        return out
+
+    col_prod = pick_col(df_precos, ["PROD"])
     col_sku = pick_col(df_precos, ["SKU"])
-    col_desc = pick_col(df_precos, ["DESCRICAO"])  # prioriza PROD
-    if not col_sku or not col_desc:
-        return ""
-    linha = df_precos[df_precos[col_sku].astype(str) == str(sku)]
-    if linha.empty:
-        return ""
-    return normalizar_texto(linha[col_desc].values[0])
+    col_cli = pick_col(df_precos, ["CLIENTE"])
+    col_s = pick_col(df_precos, ["PRECO_ATUAL_SEM_IPI"])
+    col_c = pick_col(df_precos, ["PRECO_ATUAL_COM_IPI"])
+
+    if not col_prod and not col_sku:
+        return out
+
+    df = df_precos.copy()
+
+    if col_prod:
+        df[col_prod] = df[col_prod].apply(normalizar_texto)
+        df = df[df[col_prod] != ""]
+        prods = sorted(df[col_prod].dropna().unique().tolist())
+        out["prod_list"] = prods
+        for p in prods:
+            out["prod_to_sku"][p] = extrair_sku_de_prod(p)
+
+    if col_sku:
+        df[col_sku] = df[col_sku].astype(str)
+        out["skus_list"] = sorted(df[col_sku].dropna().unique().tolist())
+
+    if col_s and col_sku:
+        tmp = df[[col_sku, col_s]].dropna()
+        for _, r in tmp.iterrows():
+            sku = str(r[col_sku])
+            try:
+                out["preco_s_ipi_by_sku"][sku] = float(r[col_s])
+            except Exception:
+                continue
+
+    if col_c and col_sku:
+        tmp = df[[col_sku, col_c]].dropna()
+        for _, r in tmp.iterrows():
+            sku = str(r[col_sku])
+            try:
+                out["preco_c_ipi_by_sku"][sku] = float(r[col_c])
+            except Exception:
+                continue
+
+    # IPI% por SKU (preferencial)
+    if col_sku and col_s and col_c:
+        # cria mapa com ambos os preços quando possível
+        # use merges por dicionário (mais rápido que join pesado aqui)
+        for sku in out["skus_list"]:
+            ps = out["preco_s_ipi_by_sku"].get(sku)
+            pc = out["preco_c_ipi_by_sku"].get(sku)
+            out["ipi_pct_by_sku"][sku] = calc_ipi_pct(ps, pc)
+
+    # médias por cliente x sku (se houver cliente)
+    if col_cli and col_sku:
+        out["has_cliente"] = True
+        df[col_cli] = df[col_cli].astype(str)
+        out["clientes_list"] = sorted(df[col_cli].dropna().unique().tolist())
+
+        if col_s:
+            try:
+                grp = df[[col_cli, col_sku, col_s]].dropna().groupby([col_cli, col_sku])[col_s].mean()
+                out["cliente_sku_avg_s_ipi"] = {k: float(v) for k, v in grp.to_dict().items()}
+            except Exception:
+                out["cliente_sku_avg_s_ipi"] = {}
+
+        if col_c:
+            try:
+                grp = df[[col_cli, col_sku, col_c]].dropna().groupby([col_cli, col_sku])[col_c].mean()
+                out["cliente_sku_avg_c_ipi"] = {k: float(v) for k, v in grp.to_dict().items()}
+            except Exception:
+                out["cliente_sku_avg_c_ipi"] = {}
+
+        # IPI% por cliente x sku (quando houver ambos)
+        for (cli, sku), ps in out["cliente_sku_avg_s_ipi"].items():
+            pc = out["cliente_sku_avg_c_ipi"].get((cli, sku))
+            out["cliente_sku_ipi_pct"][(cli, sku)] = calc_ipi_pct(ps, pc)
+
+    return out
 
 
-def get_cpv(df_inv: pd.DataFrame, sku: str) -> Optional[float]:
+def build_inv_lookup(df_inv: pd.DataFrame) -> Dict[str, float]:
+    if df_inv is None or df_inv.empty:
+        return {}
     col_sku = pick_col(df_inv, ["SKU"])
     col_custo = pick_col(df_inv, ["CUSTO_INVENTARIO"])
     if not col_sku or not col_custo:
-        return None
-    linha = df_inv[df_inv[col_sku].astype(str) == str(sku)]
-    if linha.empty:
-        return None
-    try:
-        return float(linha[col_custo].values[0])
-    except Exception:
-        return None
+        return {}
+    out = {}
+    tmp = df_inv[[col_sku, col_custo]].dropna()
+    for _, r in tmp.iterrows():
+        sku = str(r[col_sku])
+        try:
+            out[sku] = float(r[col_custo])
+        except Exception:
+            continue
+    return out
 
 
-def get_frete_pct_uf(df_frete: pd.DataFrame, uf: str) -> Optional[float]:
-    """
-    Frete deve ser percentual por UF (ex.: 0.045 = 4,5%).
-    Se vier como 4.5 (em %), convertemos para 0.045.
-    """
+def build_frete_lookup(df_frete: pd.DataFrame) -> Dict[str, float]:
+    if df_frete is None or df_frete.empty:
+        return {}
     col_uf = pick_col(df_frete, ["UF"])
     col_pct = pick_col(df_frete, ["FRETE_PCT"])
     if not col_uf or not col_pct:
-        return None
+        return {}
+    out = {}
+    tmp = df_frete[[col_uf, col_pct]].dropna()
+    for _, r in tmp.iterrows():
+        uf = str(r[col_uf]).upper()
+        try:
+            v = float(r[col_pct])
+            if v > 1.0:
+                v = v / 100.0
+            out[uf] = max(0.0, min(v, 0.90))
+        except Exception:
+            continue
+    return out
 
-    linha = df_frete[df_frete[col_uf].astype(str).str.upper() == str(uf).upper()]
-    if linha.empty:
-        return None
 
-    try:
-        v = float(linha[col_pct].values[0])
-        # se vier em "percentual cheio" (ex.: 4.5), converte
-        if v > 1.0:
-            v = v / 100.0
-        return max(0.0, min(v, 0.90))
-    except Exception:
-        return None
-
-
-def get_vpc_cliente(df_vpc: pd.DataFrame, cliente: str, sku: Optional[str] = None) -> float:
-    col_cliente = pick_col(df_vpc, ["CLIENTE"])
+def build_vpc_lookup(df_vpc: pd.DataFrame) -> Dict[tuple, float]:
+    if df_vpc is None or df_vpc.empty:
+        return {}
+    col_cli = pick_col(df_vpc, ["CLIENTE"])
     col_vpc = pick_col(df_vpc, ["VPC"])
     col_sku = pick_col(df_vpc, ["SKU"])
-    if not col_cliente or not col_vpc:
-        return 0.0
+    if not col_cli or not col_vpc:
+        return {}
+    out = {}
+    df = df_vpc.copy()
+    df[col_cli] = df[col_cli].astype(str)
+    if col_sku:
+        df[col_sku] = df[col_sku].astype(str)
 
-    base = df_vpc[df_vpc[col_cliente].astype(str) == str(cliente)]
-    if sku and col_sku and not base.empty:
-        base_sku = base[base[col_sku].astype(str) == str(sku)]
-        if not base_sku.empty:
-            base = base_sku
+    cols = [col_cli, col_vpc] + ([col_sku] if col_sku else [])
+    for _, r in df[cols].dropna().iterrows():
+        cli = str(r[col_cli])
+        sku = str(r[col_sku]) if col_sku else "*"
+        try:
+            v = float(r[col_vpc])
+            if v > 1.0:
+                v = v / 100.0
+            v = max(0.0, min(v, 0.90))
+            out[(cli, sku)] = v
+        except Exception:
+            continue
 
-    if base.empty:
-        return 0.0
+    if col_sku:
+        try:
+            grp = df[[col_cli, col_vpc]].dropna().groupby(col_cli)[col_vpc].mean()
+            for cli, v in grp.to_dict().items():
+                vv = float(v)
+                if vv > 1.0:
+                    vv = vv / 100.0
+                out[(str(cli), "*")] = max(0.0, min(vv, 0.90))
+        except Exception:
+            pass
+
+    return out
+
+
+# ==================== DASHBOARD (analytics) ====================
+@st.cache_data(ttl=Config.CACHE_TTL, show_spinner=False)
+def carregar_logs_dashboard(supabase, dt_ini_iso: str, dt_fim_iso: str) -> pd.DataFrame:
+    """
+    Busca logs no Supabase para o dashboard. Se não existir tabela, retorna vazio.
+    """
     try:
-        v = float(base[col_vpc].values[0])
-        if v > 1.0:
-            v = v / 100.0
-        return max(0.0, min(v, 0.90))
+        if not supabase_tabela_existe(supabase, "log_simulacoes"):
+            return pd.DataFrame()
+        # tenta buscar intervalo (padrão data_hora)
+        q = supabase.table("log_simulacoes").select("*").gte("data_hora", dt_ini_iso).lte("data_hora", dt_fim_iso)
+        resp = q.execute()
+        if not resp.data:
+            return pd.DataFrame()
+        return pd.DataFrame(resp.data)
     except Exception:
-        return 0.0
+        return pd.DataFrame()
 
 
-def listar_clientes(df_vpc: pd.DataFrame) -> List[str]:
-    col_cliente = pick_col(df_vpc, ["CLIENTE"])
-    if not col_cliente:
-        return []
-    vals = sorted(df_vpc[col_cliente].astype(str).dropna().unique().tolist())
-    return [v for v in vals if v.strip()]
+def filtrar_df_dashboard(df: pd.DataFrame, cliente: str, sku: str, tipo: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    # normaliza colunas
+    for col in ["cliente", "sku", "tipo"]:
+        if col in out.columns:
+            out[col] = out[col].astype(str)
 
+    if tipo != "Todos" and "tipo" in out.columns:
+        out = out[out["tipo"] == tipo]
 
-def construir_lista_sku_descricao(df_precos: pd.DataFrame) -> Tuple[List[str], Dict[str, str]]:
-    col_sku = pick_col(df_precos, ["SKU"])
-    col_desc = pick_col(df_precos, ["DESCRICAO"])  # prioriza PROD
-    if not col_sku:
-        return [], {}
+    if cliente != "Todos" and "cliente" in out.columns:
+        out = out[out["cliente"] == cliente]
 
-    df = df_precos.copy()
-    df[col_sku] = df[col_sku].astype(str)
+    if sku != "Todos" and "sku" in out.columns:
+        out = out[out["sku"] == sku]
 
-    if col_desc:
-        df[col_desc] = df[col_desc].apply(normalizar_texto)
-    else:
-        df["_DESC_FAKE_"] = ""
-        col_desc = "_DESC_FAKE_"
-
-    df = df[[col_sku, col_desc]].drop_duplicates()
-    df[col_desc] = df[col_desc].fillna("").astype(str)
-
-    opcoes: List[str] = []
-    mapa: Dict[str, str] = {}
-    for _, row in df.iterrows():
-        sku = normalizar_texto(row[col_sku])
-        desc = normalizar_texto(row[col_desc])
-        label = sku + " - " + (desc if desc else "(sem descrição)")
-        opcoes.append(label)
-        mapa[label] = sku
-
-    opcoes = sorted(opcoes)
-    return opcoes, mapa
+    # parse data_hora
+    if "data_hora" in out.columns:
+        try:
+            out["data_hora"] = pd.to_datetime(out["data_hora"], errors="coerce")
+        except Exception:
+            pass
+    return out
 
 
 # ==================== TELAS ====================
 def inicializar_sessao():
     defaults = {"autenticado": False, "perfil": Config.PERFIL_VENDEDOR, "email": "", "nome": "Usuário"}
     for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    persist_defaults = {
+        "last_prod": "",
+        "last_modo": "UF destino",
+        "last_uf": "SP",
+        "last_cliente": "",
+        "last_aplicar_vpc": False,
+        "last_pedido_cliente": "",
+        "last_pedido_itens": [],
+    }
+    for k, v in persist_defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -710,7 +843,7 @@ def tela_login(supabase):
                     st.error("❌ E-mail ou senha incorretos")
 
 
-def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
+def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, float]):
     st.title("🔎 Consulta de Preços + Margens (MC / EBITDA)")
 
     with st.spinner("Carregando bases..."):
@@ -743,64 +876,109 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
             st.info("💡 Vá em **⚙️ Configurações** para corrigir links e/ou parâmetros.")
         return
 
-    opcoes, mapa_label_para_sku = construir_lista_sku_descricao(df_precos)
-    if not opcoes:
-        st.error("❌ Base 'Preços Atuais' sem coluna SKU/Produto/CODPRO (ou equivalente).")
+    precos_lk = build_precos_lookup(df_precos)
+    inv_lk = build_inv_lookup(df_inv)
+    frete_lk = build_frete_lookup(df_frete)
+    vpc_lk = build_vpc_lookup(df_vpc)
+
+    prod_list = precos_lk.get("prod_list", [])
+    if not prod_list:
+        st.error("❌ A base 'Preços Atuais' precisa ter a coluna PROD (ou equivalente).")
         return
 
     st.divider()
     st.subheader("📌 Parâmetros de consulta")
 
-    col_a, col_b, col_c = st.columns([3, 2, 2])
+    col_a, col_b, col_c = st.columns([4, 2, 2])
 
     with col_a:
-        selecao = st.selectbox("Buscar por SKU ou Descrição (PROD)", options=["Selecione..."] + opcoes)
-        if selecao == "Selecione...":
-            st.info("💡 Selecione um item para consultar.")
+        last_prod = st.session_state.get("last_prod", "")
+        options = ["Selecione..."] + prod_list
+        idx = options.index(last_prod) if last_prod in options else 0
+        prod = st.selectbox("Buscar por PROD (já contém SKU + Descrição)", options=options, index=idx, key="consulta_prod_select")
+        if prod == "Selecione...":
+            st.info("💡 Selecione um PROD para consultar.")
             return
-        sku = mapa_label_para_sku.get(selecao, "")
+        st.session_state["last_prod"] = prod
 
     with col_b:
-        modo = st.radio("Base de destino", options=["UF destino", "Cliente"], horizontal=True)
+        modo = st.radio(
+            "Base de destino",
+            options=["UF destino", "Cliente"],
+            horizontal=True,
+            index=0 if st.session_state.get("last_modo") == "UF destino" else 1,
+            key="consulta_modo_radio",
+        )
+        st.session_state["last_modo"] = modo
 
     with col_c:
         if modo == "UF destino":
-            uf = st.selectbox("UF destino", options=Config.UFS_BRASIL)
-            cliente = None
+            uf = st.selectbox(
+                "UF destino",
+                options=Config.UFS_BRASIL,
+                index=Config.UFS_BRASIL.index(st.session_state.get("last_uf", "SP")) if st.session_state.get("last_uf", "SP") in Config.UFS_BRASIL else 0,
+                key="consulta_uf_select",
+            )
+            st.session_state["last_uf"] = uf
+            cliente = ""
         else:
-            clientes = listar_clientes(df_vpc)
-            cliente = st.selectbox("Cliente / Nome", options=["Selecione..."] + clientes) if clientes else "Selecione..."
-            uf = st.selectbox("UF destino (fallback)", options=Config.UFS_BRASIL)
+            clientes = precos_lk.get("clientes_list", [])
+            opt_cli = ["Selecione..."] + clientes
+            last_cliente = st.session_state.get("last_cliente", "")
+            idx_cli = opt_cli.index(last_cliente) if last_cliente in opt_cli else 0
+            cliente = st.selectbox("Cliente / Nome", options=opt_cli, index=idx_cli, key="consulta_cliente_select")
+            st.session_state["last_cliente"] = cliente
 
-    desc = get_desc_from_df_precos(df_precos, sku)
-    st.caption("SKU: **" + sku + "** | PROD: **" + (desc if desc else "(sem descrição)") + "**")
+            uf = st.selectbox(
+                "UF destino (fallback)",
+                options=Config.UFS_BRASIL,
+                index=Config.UFS_BRASIL.index(st.session_state.get("last_uf", "SP")) if st.session_state.get("last_uf", "SP") in Config.UFS_BRASIL else 0,
+                key="consulta_uf_select_fallback",
+            )
+            st.session_state["last_uf"] = uf
 
-    # Dados-base para o cálculo oficial
-    cpv = get_cpv(df_inv, sku)
+    sku = precos_lk.get("prod_to_sku", {}).get(prod, "") or extrair_sku_de_prod(prod)
+    if not sku:
+        st.error("❌ Não consegui extrair SKU a partir do PROD. Ação: revise o padrão do PROD para iniciar com o SKU.")
+        return
+
+    st.caption("SKU (extraído do PROD): **" + sku + "**")
+
+    cpv = inv_lk.get(sku)
     if cpv is None:
-        st.error("❌ Não achei o CPV/CPV na base 'Inventário' (Custo Inventário/CMV/CPV...).")
+        st.error("❌ Não achei o CPV na base 'Inventário' para esse SKU.")
         return
 
-    frete_pct = get_frete_pct_uf(df_frete, uf)
+    frete_pct = frete_lk.get(str(uf).upper())
     if frete_pct is None:
-        st.error(
-            "❌ Frete UF precisa estar em percentual por UF.\n\n"
-            "Ação: na base Frete, garanta as colunas UF e Frete% (ex.: 0,045 para 4,5% ou 4,5)."
-        )
+        st.error("❌ Base Frete precisa trazer Frete% por UF (ex.: 0,045 ou 4,5).")
         return
+
+    # Preços atuais + IPI% por SKU (derivado)
+    preco_atual_s = precos_lk.get("preco_s_ipi_by_sku", {}).get(sku)
+    preco_atual_c = precos_lk.get("preco_c_ipi_by_sku", {}).get(sku)
+    ipi_pct_sku = precos_lk.get("ipi_pct_by_sku", {}).get(sku, 0.0)
+
+    # Cliente médio (se existir)
+    preco_cli_s = None
+    preco_cli_c = None
+    ipi_pct_cli = None
+    if modo == "Cliente" and cliente and cliente != "Selecione..." and precos_lk.get("has_cliente"):
+        preco_cli_s = precos_lk.get("cliente_sku_avg_s_ipi", {}).get((cliente, sku))
+        preco_cli_c = precos_lk.get("cliente_sku_avg_c_ipi", {}).get((cliente, sku))
+        ipi_pct_cli = precos_lk.get("cliente_sku_ipi_pct", {}).get((cliente, sku))
 
     # VPC condicional
     vpc_pct = 0.0
     aplicar_vpc = False
     if modo == "Cliente" and cliente and cliente != "Selecione...":
-        vpc_pct = get_vpc_cliente(df_vpc, cliente, sku=sku)
-        aplicar_vpc = st.toggle("Aplicar VPC", value=(vpc_pct > 0))
+        vpc_pct = vpc_lk.get((cliente, sku), vpc_lk.get((cliente, "*"), 0.0))
+        aplicar_default = bool(vpc_pct > 0.0)
+        aplicar_vpc = st.toggle("Aplicar VPC", value=st.session_state.get("last_aplicar_vpc", aplicar_default), key="consulta_aplicar_vpc")
+        st.session_state["last_aplicar_vpc"] = aplicar_vpc
         st.caption("VPC previsto: " + (formatar_pct(vpc_pct) if vpc_pct > 0 else "0,00%"))
 
-    # Preço atual (referência)
-    preco_atual = get_price_from_df_precos(df_precos, sku)
-
-    # Cálculo oficial do preço sugerido
+    # Preço sugerido
     try:
         preco_sugerido_sem_ipi, detalhes_grossup = PrecificacaoOficialAMVOX.calcular_preco_sugerido_sem_ipi(
             cpv=cpv,
@@ -813,7 +991,6 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
         st.error("❌ Não foi possível calcular o Preço Sugerido: " + tradutor_erro(e))
         return
 
-    # MC e EBITDA no preço sugerido
     res = PrecificacaoOficialAMVOX.calcular_mc_ebitda(
         preco_sem_ipi=preco_sugerido_sem_ipi,
         cpv=cpv,
@@ -823,26 +1000,62 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
         vpc_pct=vpc_pct,
     )
 
-    # Preço com IPI (opcional)
-    ipi = float(params.get("IPI", 0.0))
-    preco_com_ipi = float(preco_sugerido_sem_ipi) * (1.0 + ipi)
+    # IPI% usado: prioriza cliente (se calculável), senão SKU, senão 0
+    ipi_usado = 0.0
+    if ipi_pct_cli is not None and ipi_pct_cli > 0:
+        ipi_usado = ipi_pct_cli
+    elif ipi_pct_sku > 0:
+        ipi_usado = ipi_pct_sku
+
+    preco_sugerido_com_ipi = float(res["preco_sem_ipi"]) * (1.0 + ipi_usado)
 
     st.divider()
     st.subheader("📊 Resultado (Cálculo Automático)")
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     with m1:
-        st.metric("Preço Sugerido (Sem IPI)", formatar_moeda(res["preco_sem_ipi"]))
-        st.caption("Preço com IPI (opcional): " + formatar_moeda(preco_com_ipi))
+        st.metric("Preço Sugerido s/ IPI", formatar_moeda(res["preco_sem_ipi"]))
     with m2:
-        st.metric("MC", formatar_moeda(res["mc_val"]), formatar_pct(res["mc_pct"]))
+        st.metric("Preço Sugerido c/ IPI", formatar_moeda(preco_sugerido_com_ipi))
+        st.caption("IPI% (derivado): " + formatar_pct(ipi_usado))
     with m3:
-        st.metric("EBITDA", formatar_moeda(res["ebitda_val"]), formatar_pct(res["ebitda_pct"]))
+        st.metric("MC", formatar_moeda(res["mc_val"]), formatar_pct(res["mc_pct"]))
     with m4:
-        if preco_atual is None:
-            st.metric("Preço Atual (ref.)", "N/D")
+        st.metric("EBITDA", formatar_moeda(res["ebitda_val"]), formatar_pct(res["ebitda_pct"]))
+    with m5:
+        if modo == "Cliente" and cliente and cliente != "Selecione..." and (preco_cli_s or preco_cli_c):
+            s_txt = formatar_moeda(preco_cli_s) if preco_cli_s is not None else "N/D"
+            c_txt = formatar_moeda(preco_cli_c) if preco_cli_c is not None else "N/D"
+            st.metric("Preço Atual médio (Cliente) s/ IPI", s_txt)
+            st.caption("c/ IPI: " + c_txt)
         else:
-            st.metric("Preço Atual (ref.)", formatar_moeda(preco_atual))
+            s_txt = formatar_moeda(preco_atual_s) if preco_atual_s is not None else "N/D"
+            c_txt = formatar_moeda(preco_atual_c) if preco_atual_c is not None else "N/D"
+            st.metric("Preço Atual s/ IPI", s_txt)
+            st.caption("Preço Atual c/ IPI: " + c_txt)
+
+    # Telemetria
+    tentar_gravar_log(
+        supabase,
+        {
+            "tipo": "consulta",
+            "email": st.session_state.get("email", ""),
+            "perfil": st.session_state.get("perfil", ""),
+            "sku": sku,
+            "prod": prod,
+            "cliente": (cliente if cliente and cliente != "Selecione..." else ""),
+            "uf": uf,
+            "aplicar_vpc": bool(aplicar_vpc),
+            "vpc_pct": float(vpc_pct or 0.0),
+            "frete_pct": float(frete_pct),
+            "cpv": float(cpv),
+            "preco_sugerido_sem_ipi": float(res["preco_sem_ipi"]),
+            "preco_sugerido_com_ipi": float(preco_sugerido_com_ipi),
+            "ipi_pct": float(ipi_usado),
+            "mc_pct": float(res["mc_pct"]),
+            "ebitda_pct": float(res["ebitda_pct"]),
+        },
+    )
 
     st.divider()
     mc_alvo = float(params.get("MC_ALVO", 0.09))
@@ -867,6 +1080,345 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
         st.write("- VPC (condicional): " + formatar_pct(detalhes_grossup["vpc_cond"]))
 
 
+def tela_simular_pedido(supabase, links: Dict[str, str], params: Dict[str, float]):
+    st.title("🧾 Simular Margens do Pedido (itens + consolidação)")
+
+    with st.spinner("Carregando bases..."):
+        df_precos, ok_p, msg_p = load_excel_base(links.get("Preços Atuais", ""))
+        df_inv, ok_i, msg_i = load_excel_base(links.get("Inventário", ""))
+        df_frete, ok_f, msg_f = load_excel_base(links.get("Frete", ""))
+        df_vpc, ok_v, msg_v = load_excel_base(links.get("VPC por cliente", ""))
+
+    status = {
+        "Preços Atuais": (ok_p, msg_p),
+        "Inventário": (ok_i, msg_i),
+        "Frete": (ok_f, msg_f),
+        "VPC por cliente": (ok_v, msg_v),
+    }
+
+    falhas = [n for n, (ok, _) in status.items() if not ok]
+    with st.expander("📌 Status das Bases", expanded=bool(falhas)):
+        c = st.columns(2)
+        for idx, (nome, (ok, msg)) in enumerate(status.items()):
+            with c[idx % 2]:
+                if ok:
+                    st.success("✅ " + nome)
+                else:
+                    st.error("❌ " + nome)
+                    st.caption(msg)
+
+    if falhas:
+        st.error("⚠️ Não é possível simular pedido enquanto houver base indisponível: " + ", ".join(falhas))
+        if is_admin():
+            st.info("💡 Vá em **⚙️ Configurações** para corrigir links e/ou parâmetros.")
+        return
+
+    precos_lk = build_precos_lookup(df_precos)
+    inv_lk = build_inv_lookup(df_inv)
+    frete_lk = build_frete_lookup(df_frete)
+    vpc_lk = build_vpc_lookup(df_vpc)
+
+    prod_list = precos_lk.get("prod_list", [])
+    if not prod_list:
+        st.error("❌ A base 'Preços Atuais' precisa ter a coluna PROD (ou equivalente).")
+        return
+
+    st.subheader("📌 Parâmetros do Pedido")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        clientes = precos_lk.get("clientes_list", [])
+        opt_cli = ["Selecione..."] + clientes
+        last_cli = st.session_state.get("last_pedido_cliente", "")
+        idx_cli = opt_cli.index(last_cli) if last_cli in opt_cli else 0
+        cliente = st.selectbox("Cliente / Nome", options=opt_cli, index=idx_cli, key="pedido_cliente_select")
+        st.session_state["last_pedido_cliente"] = cliente
+
+    with col2:
+        uf = st.selectbox("UF destino do pedido", options=Config.UFS_BRASIL, key="pedido_uf_select")
+
+    frete_pct = frete_lk.get(str(uf).upper())
+    if frete_pct is None:
+        st.error("❌ Base Frete deve trazer Frete% por UF.")
+        return
+
+    st.divider()
+    st.subheader("📦 Itens do Pedido")
+
+    last_itens = st.session_state.get("last_pedido_itens", [])
+    itens = st.multiselect("Selecione os PROD(s) do pedido", options=prod_list, default=last_itens, key="pedido_itens_multi")
+    st.session_state["last_pedido_itens"] = itens
+
+    if not itens:
+        st.info("💡 Selecione ao menos 1 item para simular.")
+        return
+
+    aplicar_vpc = False
+    vpc_pct_cliente = 0.0
+    if cliente and cliente != "Selecione...":
+        vpc_pct_cliente = vpc_lk.get((cliente, "*"), 0.0)
+        aplicar_vpc = st.toggle("Aplicar VPC no pedido (condicional)", value=(vpc_pct_cliente > 0.0), key="pedido_aplicar_vpc")
+        st.caption("VPC previsto (cliente): " + (formatar_pct(vpc_pct_cliente) if vpc_pct_cliente > 0 else "0,00%"))
+    else:
+        st.warning("⚠️ Cliente não selecionado. VPC não será aplicado.")
+
+    rows = []
+    total_receita_base = 0.0
+    total_mc = 0.0
+    total_ebitda = 0.0
+
+    for prod in itens:
+        sku = precos_lk.get("prod_to_sku", {}).get(prod, "") or extrair_sku_de_prod(prod)
+        if not sku:
+            continue
+
+        cpv = inv_lk.get(sku)
+        if cpv is None:
+            rows.append({"PROD": prod, "SKU": sku, "Status": "❌ Sem CPV no Inventário"})
+            continue
+
+        # VPC por item
+        vpc_item = 0.0
+        if cliente and cliente != "Selecione...":
+            vpc_item = vpc_lk.get((cliente, sku), vpc_lk.get((cliente, "*"), 0.0))
+
+        # IPI% por item: prioriza cliente x sku, senão SKU
+        ipi_item = 0.0
+        ipi_cli = precos_lk.get("cliente_sku_ipi_pct", {}).get((cliente, sku)) if (cliente and cliente != "Selecione...") else None
+        if ipi_cli is not None and ipi_cli > 0:
+            ipi_item = ipi_cli
+        else:
+            ipi_item = precos_lk.get("ipi_pct_by_sku", {}).get(sku, 0.0)
+
+        try:
+            preco_s, _det = PrecificacaoOficialAMVOX.calcular_preco_sugerido_sem_ipi(
+                cpv=cpv,
+                frete_pct=frete_pct,
+                params=params,
+                aplicar_vpc=aplicar_vpc,
+                vpc_pct=vpc_item,
+            )
+            res = PrecificacaoOficialAMVOX.calcular_mc_ebitda(
+                preco_sem_ipi=preco_s,
+                cpv=cpv,
+                frete_pct=frete_pct,
+                params=params,
+                aplicar_vpc=aplicar_vpc,
+                vpc_pct=vpc_item,
+            )
+            preco_c = float(preco_s) * (1.0 + ipi_item)
+
+            # preço atual médio cliente x sku (se existir), senão geral
+            preco_atual_s = None
+            preco_atual_c = None
+            if cliente and cliente != "Selecione..." and precos_lk.get("has_cliente"):
+                preco_atual_s = precos_lk.get("cliente_sku_avg_s_ipi", {}).get((cliente, sku))
+                preco_atual_c = precos_lk.get("cliente_sku_avg_c_ipi", {}).get((cliente, sku))
+            if preco_atual_s is None:
+                preco_atual_s = precos_lk.get("preco_s_ipi_by_sku", {}).get(sku)
+            if preco_atual_c is None:
+                preco_atual_c = precos_lk.get("preco_c_ipi_by_sku", {}).get(sku)
+
+            rows.append({
+                "PROD": prod,
+                "SKU": sku,
+                "Preço Sugerido s/ IPI": float(preco_s),
+                "Preço Sugerido c/ IPI": float(preco_c),
+                "IPI (%)": float(ipi_item),
+                "MC (R$)": float(res["mc_val"]),
+                "MC (%)": float(res["mc_pct"]),
+                "EBITDA (R$)": float(res["ebitda_val"]),
+                "EBITDA (%)": float(res["ebitda_pct"]),
+                "Preço Atual s/ IPI": float(preco_atual_s) if preco_atual_s is not None else None,
+                "Preço Atual c/ IPI": float(preco_atual_c) if preco_atual_c is not None else None,
+                "VPC (%)": float(vpc_item),
+                "Status": "OK",
+            })
+
+            total_receita_base += float(res["receita_base"])
+            total_mc += float(res["mc_val"])
+            total_ebitda += float(res["ebitda_val"])
+
+            # Telemetria por item (pedido)
+            tentar_gravar_log(
+                supabase,
+                {
+                    "tipo": "pedido_item",
+                    "email": st.session_state.get("email", ""),
+                    "perfil": st.session_state.get("perfil", ""),
+                    "sku": sku,
+                    "prod": prod,
+                    "cliente": (cliente if cliente and cliente != "Selecione..." else ""),
+                    "uf": uf,
+                    "aplicar_vpc": bool(aplicar_vpc),
+                    "vpc_pct": float(vpc_item or 0.0),
+                    "frete_pct": float(frete_pct),
+                    "cpv": float(cpv),
+                    "preco_sugerido_sem_ipi": float(res["preco_sem_ipi"]),
+                    "preco_sugerido_com_ipi": float(preco_c),
+                    "ipi_pct": float(ipi_item),
+                    "mc_pct": float(res["mc_pct"]),
+                    "ebitda_pct": float(res["ebitda_pct"]),
+                },
+            )
+
+        except Exception as e:
+            rows.append({"PROD": prod, "SKU": sku, "Status": "❌ Falha no cálculo: " + str(e)})
+
+    df_out = pd.DataFrame(rows)
+
+    st.divider()
+    st.subheader("📊 Resultado por Item")
+
+    if not df_out.empty:
+        df_show = df_out.copy()
+        for col in ["Preço Sugerido s/ IPI", "Preço Sugerido c/ IPI", "MC (R$)", "EBITDA (R$)", "Preço Atual s/ IPI", "Preço Atual c/ IPI"]:
+            if col in df_show.columns:
+                df_show[col] = df_show[col].apply(lambda x: formatar_moeda(x) if isinstance(x, (int, float)) and x is not None else ("N/D" if x is None else x))
+        for col in ["MC (%)", "EBITDA (%)", "VPC (%)", "IPI (%)"]:
+            if col in df_show.columns:
+                df_show[col] = df_show[col].apply(lambda x: formatar_pct(x) if isinstance(x, (int, float)) and x is not None else ("N/D" if x is None else x))
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("🧮 Consolidação do Pedido")
+
+    mc_pct_pedido = (total_mc / total_receita_base) if total_receita_base > 0 else 0.0
+    ebitda_pct_pedido = (total_ebitda / total_receita_base) if total_receita_base > 0 else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Receita Base (pedido)", formatar_moeda(total_receita_base))
+    with c2:
+        st.metric("MC (pedido)", formatar_moeda(total_mc), formatar_pct(mc_pct_pedido))
+    with c3:
+        st.metric("EBITDA (pedido)", formatar_moeda(total_ebitda), formatar_pct(ebitda_pct_pedido))
+
+
+def tela_dashboard(supabase, links: Dict[str, str]):
+    st.title("📊 Dashboard (Analytics do Aplicativo)")
+
+    if not supabase_tabela_existe(supabase, "log_simulacoes"):
+        st.warning("⚠️ A tabela **log_simulacoes** não existe no Supabase. Sem ela, o Dashboard fica sem dados.")
+        st.info(
+            "Ação recomendada (mínimo viável): criar tabela log_simulacoes com colunas:\n"
+            "- data_hora (text/timestamp)\n"
+            "- tipo (text)\n"
+            "- email (text)\n"
+            "- perfil (text)\n"
+            "- sku (text)\n"
+            "- prod (text)\n"
+            "- cliente (text)\n"
+            "- uf (text)\n"
+            "- aplicar_vpc (bool)\n"
+            "- vpc_pct (numeric)\n"
+            "- frete_pct (numeric)\n"
+            "- cpv (numeric)\n"
+            "- preco_sugerido_sem_ipi (numeric)\n"
+            "- preco_sugerido_com_ipi (numeric)\n"
+            "- ipi_pct (numeric)\n"
+            "- mc_pct (numeric)\n"
+            "- ebitda_pct (numeric)\n"
+        )
+        return
+
+    # Filtros
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        dt_ini = st.date_input("Período - Início", value=date.today().replace(day=1))
+    with col2:
+        dt_fim = st.date_input("Período - Fim", value=date.today())
+    with col3:
+        tipo = st.selectbox("Tipo", options=["Todos", "consulta", "pedido_item"])
+
+    # ISO range (inclui o dia fim até 23:59:59)
+    dt_ini_iso = datetime(dt_ini.year, dt_ini.month, dt_ini.day, 0, 0, 0).isoformat()
+    dt_fim_iso = datetime(dt_fim.year, dt_fim.month, dt_fim.day, 23, 59, 59).isoformat()
+
+    df = carregar_logs_dashboard(supabase, dt_ini_iso, dt_fim_iso)
+    if df.empty:
+        st.info("💡 Sem registros no período selecionado.")
+        return
+
+    # Catálogo de Cliente/SKU para filtro
+    clientes = sorted([c for c in df["cliente"].astype(str).unique().tolist() if c and c != "nan"]) if "cliente" in df.columns else []
+    skus = sorted([s for s in df["sku"].astype(str).unique().tolist() if s and s != "nan"]) if "sku" in df.columns else []
+
+    c4, c5 = st.columns(2)
+    with c4:
+        cliente = st.selectbox("Cliente", options=["Todos"] + clientes)
+    with c5:
+        sku = st.selectbox("SKU", options=["Todos"] + skus)
+
+    df_f = filtrar_df_dashboard(df, cliente=cliente, sku=sku, tipo=tipo)
+
+    if df_f.empty:
+        st.info("💡 Sem dados para esse recorte (Cliente/SKU/Tipo/Período).")
+        return
+
+    # KPIs
+    total = len(df_f)
+    mc_med = float(pd.to_numeric(df_f.get("mc_pct", pd.Series([0])), errors="coerce").dropna().mean() or 0.0)
+    ebitda_med = float(pd.to_numeric(df_f.get("ebitda_pct", pd.Series([0])), errors="coerce").dropna().mean() or 0.0)
+    ipi_med = float(pd.to_numeric(df_f.get("ipi_pct", pd.Series([0])), errors="coerce").dropna().mean() or 0.0)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("Registros", str(total))
+    with k2:
+        st.metric("MC médio", formatar_pct(mc_med))
+    with k3:
+        st.metric("EBITDA médio", formatar_pct(ebitda_med))
+    with k4:
+        st.metric("IPI médio (derivado)", formatar_pct(ipi_med))
+
+    st.divider()
+
+    # Série temporal
+    if "data_hora" in df_f.columns:
+        try:
+            df_f["data_hora"] = pd.to_datetime(df_f["data_hora"], errors="coerce")
+            df_ts = df_f.dropna(subset=["data_hora"]).copy()
+            df_ts["dia"] = df_ts["data_hora"].dt.date.astype(str)
+
+            mc_dia = df_ts.groupby("dia")["mc_pct"].mean(numeric_only=True)
+            ebitda_dia = df_ts.groupby("dia")["ebitda_pct"].mean(numeric_only=True)
+
+            st.subheader("📈 Tendência (média diária)")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption("MC% (média diária)")
+                st.line_chart(mc_dia)
+            with c2:
+                st.caption("EBITDA% (média diária)")
+                st.line_chart(ebitda_dia)
+        except Exception:
+            st.warning("⚠️ Não foi possível renderizar tendência por data. Verifique coluna data_hora na tabela log_simulacoes.")
+
+    st.divider()
+
+    # Rankings
+    st.subheader("🏆 Rankings (Top 10)")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if "sku" in df_f.columns:
+            top_sku = df_f["sku"].astype(str).value_counts().head(10)
+            st.caption("Top SKU por volume de consultas/simulações")
+            st.bar_chart(top_sku)
+
+    with c2:
+        if "cliente" in df_f.columns:
+            top_cli = df_f["cliente"].astype(str).value_counts().head(10)
+            st.caption("Top Cliente por volume de consultas/simulações")
+            st.bar_chart(top_cli)
+
+    st.divider()
+    st.subheader("🧾 Base de registros (detalhe)")
+    st.dataframe(df_f.sort_values(by="data_hora", ascending=False) if "data_hora" in df_f.columns else df_f, use_container_width=True, hide_index=True)
+
+
 def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]):
     st.title("⚙️ Configurações (ADM/Master)")
     if not is_admin():
@@ -882,6 +1434,7 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
             url_salva = links.get(base, "")
             with st.expander("📊 " + base, expanded=True):
                 link = st.text_area("Link da planilha", value=url_salva, key="link_" + base, height=110)
+
                 if link and link.strip():
                     link_limpo = link.strip()
                     plataforma = identificar_plataforma_link(link_limpo)
@@ -934,7 +1487,6 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
 
         with col3:
             overhead = st.number_input("Overhead corporativo (%) (fora do preço)", 0.0, 100.0, float(params.get("OVERHEAD", 0.16) * 100), 0.1)
-            ipi = st.number_input("IPI (%) (opcional para exibir preço com IPI)", 0.0, 100.0, float(params.get("IPI", 0.0) * 100), 0.1)
 
         st.divider()
         if st.button("💾 Salvar Parâmetros", type="primary", use_container_width=True):
@@ -946,7 +1498,6 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
                 "MC_ALVO": mc_alvo / 100.0,
                 "MOD": mod / 100.0,
                 "OVERHEAD": overhead / 100.0,
-                "IPI": ipi / 100.0,
             }
 
             falhas = []
@@ -980,6 +1531,7 @@ def tela_sobre(params: Dict[str, float]):
             st.write(f"- {k}: {formatar_pct(params[k])}")
 
 
+# ==================== APLICAÇÃO PRINCIPAL ====================
 def main():
     inicializar_sessao()
     supabase = init_connection()
@@ -996,11 +1548,11 @@ def main():
         st.caption("🎭 " + str(st.session_state.get("perfil")))
         st.divider()
 
-        opcoes = ["🔎 Consulta de Preços", "ℹ️ Sobre"]
+        opcoes = ["🔎 Consulta de Preços", "🧾 Simular Pedido", "📊 Dashboard", "ℹ️ Sobre"]
         if is_admin():
-            opcoes.insert(1, "⚙️ Configurações")
+            opcoes.insert(3, "⚙️ Configurações")
 
-        menu = st.radio("📍 Menu", opcoes, label_visibility="collapsed")
+        menu = st.radio("📍 Menu", opcoes, label_visibility="collapsed", key="menu_radio")
 
         st.divider()
         if st.button("🚪 Sair", use_container_width=True):
@@ -1012,7 +1564,11 @@ def main():
         st.caption("v" + __version__ + " | " + __release_date__)
 
     if menu == "🔎 Consulta de Preços":
-        tela_consulta_precos(links, params)
+        tela_consulta_precos(supabase, links, params)
+    elif menu == "🧾 Simular Pedido":
+        tela_simular_pedido(supabase, links, params)
+    elif menu == "📊 Dashboard":
+        tela_dashboard(supabase, links)
     elif menu == "⚙️ Configurações":
         tela_configuracoes(supabase, links, params)
     else:
