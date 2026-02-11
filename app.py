@@ -1,9 +1,10 @@
+# app.py
 """
 PRICING 2026 - Sistema de Precificação Corporativa
-Versão: 3.8.4
+Versão: 3.8.5
 Últimas alterações (resumo):
-- Correção: salvar parâmetros não depende mais da existência de config_links (usa config_parametros; fallback JSON)
-- Robustez: detecção automática de tabelas e tratamento de erro orientado a ação
+- Correção frete: lógica híbrida %/R$ + heurística para evitar frete zerado
+- Homologação: detalhamento linha a linha da formação do preço (s/ IPI e c/ IPI) no modo governança (ADM/Master)
 - Mantido: carga sob demanda (performance), Google Drive + OneDrive/SharePoint, auditoria ADM/Master, DE/PARA
 """
 
@@ -22,7 +23,7 @@ except Exception:
     unidecode = None
 
 
-__version__ = "3.8.4"
+__version__ = "3.8.5"
 __release_date__ = "2026-02-11"
 
 
@@ -85,11 +86,18 @@ def tradutor_erro(e: Exception) -> str:
 
 DE_PARA_COLUNAS: Dict[str, Tuple[str, ...]] = {
     "CODPRO": ("CODPRO", "SKU", "PRODUTO", "CODIGO", "CÓDIGO", "COD_PROD", "CODPROD", "CODPRODUTO"),
-    "PROD": ("PROD", "DESCRICAO", "DESCRIÇÃO", "DESCRICAO DO PRODUTO", "DESCRIÇÃO DO PRODUTO", "DESCRICAO DO ITEM", "DESCRIÇÃO DO ITEM"),
+    "PROD": (
+        "PROD", "DESCRICAO", "DESCRIÇÃO", "DESCRICAO DO PRODUTO", "DESCRIÇÃO DO PRODUTO",
+        "DESCRICAO DO ITEM", "DESCRIÇÃO DO ITEM"
+    ),
     "CUSTO": ("CUSTO", "CUSTO INVENTARIO", "CUSTO INVENTÁRIO", "CPV", "CMV", "CUSTO DOS PRODUTOS", "CUSTO DA MERCADORIA"),
     "UF": ("UF", "ESTADO", "ESTADO DESTINO", "UF DESTINO"),
-    "FRETE_VALOR": ("FRETE", "VALOR", "VALOR FRETE", "FRETE UF", "FRETE_VALOR"),
-    "FRETE_PERC": ("FRETE%", "FRETE %", "PERC FRETE", "%FRETE", "FRETE PERCENTUAL", "FRETE_PERC"),
+    # FRETE: aceita valor ou percentual (em bases diferentes)
+    "FRETE_VALOR": ("FRETE", "VALOR", "VALOR FRETE", "FRETE UF", "CUSTO FRETE", "FRETE_VALOR"),
+    "FRETE_PERC": (
+        "FRETE%", "FRETE %", "PERC FRETE", "%FRETE", "FRETE PERCENTUAL", "FRETE_PERC",
+        "PERCENTUAL FRETE", "PCT FRETE", "FRETE_PCT"
+    ),
     "PRECO_ATUAL_S_IPI": ("PRECO ATUAL S/ IPI", "PREÇO ATUAL S/ IPI", "PRECO_ATUAL_S_IPI", "PRECO S/ IPI", "PREÇO S/ IPI"),
     "PRECO_ATUAL_C_IPI": ("PRECO ATUAL C/ IPI", "PREÇO ATUAL C/ IPI", "PRECO_ATUAL_C_IPI", "PRECO C/ IPI", "PREÇO C/ IPI"),
     "CLIENTE": ("CLIENTE", "NOME", "NOME CLIENTE", "RAZAO SOCIAL", "RAZÃO SOCIAL"),
@@ -241,7 +249,6 @@ def carregar_parametros(supabase) -> Dict[str, float]:
     if not supabase:
         return params
 
-    # 1) Caminho padrão: config_parametros
     try:
         resp = supabase.table("config_parametros").select("*").execute()
         for row in (resp.data or []):
@@ -256,7 +263,6 @@ def carregar_parametros(supabase) -> Dict[str, float]:
     except Exception:
         pass
 
-    # 2) Fallback: JSON em config_links (base_nome='PARAMETROS')
     try:
         resp = supabase.table("config_links").select("*").eq("base_nome", "PARAMETROS").execute()
         if resp.data:
@@ -277,7 +283,6 @@ def salvar_parametros(supabase, params: Dict[str, float]) -> Tuple[bool, str]:
     if not supabase:
         return False, "Sem conexão"
 
-    # 1) Tenta salvar em config_parametros
     try:
         for k, v in params.items():
             supabase.table("config_parametros").upsert({
@@ -287,7 +292,6 @@ def salvar_parametros(supabase, params: Dict[str, float]) -> Tuple[bool, str]:
             }).execute()
         return True, "OK"
     except Exception:
-        # tenta sem atualizado_em
         try:
             for k, v in params.items():
                 supabase.table("config_parametros").upsert({
@@ -298,7 +302,6 @@ def salvar_parametros(supabase, params: Dict[str, float]) -> Tuple[bool, str]:
         except Exception:
             pass
 
-    # 2) Fallback: salva JSON em config_links (linha PARAMETROS)
     try:
         payload = json.dumps({k: float(v) for k, v in params.items()}, ensure_ascii=False)
         try:
@@ -314,11 +317,10 @@ def salvar_parametros(supabase, params: Dict[str, float]) -> Tuple[bool, str]:
             }).execute()
         return True, "OK (fallback em config_links)"
     except Exception as e:
-        # mensagem orientada a ação
         if not _table_exists(supabase, "config_parametros") and not _table_exists(supabase, "config_links"):
             return False, (
                 "❌ Não existe tabela para salvar no Supabase. "
-                "Crie as tabelas `config_parametros` e/ou `config_links` (SQL Editor) e desabilite RLS (recomendado para iniciar)."
+                "Crie as tabelas `config_parametros` e/ou `config_links` e desabilite RLS para iniciar."
             )
         return False, tradutor_erro(e)
 
@@ -430,10 +432,12 @@ def calcular_preco_sugerido_sem_ipi(
 ) -> float:
     custo_com_mod = max(0.0, float(cpv)) * (1.0 + max(0.0, float(mod)))
     vpc_eff = float(vpc) if aplicar_vpc else 0.0
+
     total_perc = float(tributos) + float(devolucao) + float(comissao) + float(margem_alvo) + vpc_eff + float(frete_perc)
     denom = 1.0 - total_perc
     if denom <= 0:
         return 0.0
+
     numerador = custo_com_mod + max(0.0, float(frete_valor))
     return numerador / denom
 
@@ -557,7 +561,31 @@ def encontrar_cpv(df_inv: pd.DataFrame, codpro: str) -> Optional[float]:
         return None
 
 
+def _to_percent(x: float) -> float:
+    """Normaliza percentuais vindos como 0.0291, 2.91 ou 291."""
+    try:
+        v = float(x)
+    except Exception:
+        return 0.0
+    if v <= 0:
+        return 0.0
+    if v > 1.0 and v <= 100.0:
+        return v / 100.0
+    if v > 100.0:
+        return 0.0
+    return v
+
+
 def encontrar_frete(df_frete: pd.DataFrame, uf: str) -> Tuple[float, float]:
+    """
+    Retorna (frete_valor_R$, frete_perc_decimal).
+
+    Regra de decisão:
+    - Se existir coluna percentual e tiver valor válido -> usa percentual
+    - Senão, se existir coluna valor:
+        - se valor < 1 -> trata como percentual (ex.: 0.0291 = 2,91%)
+        - senão -> trata como valor em R$
+    """
     if df_frete is None or df_frete.empty or not uf:
         return 0.0, 0.0
 
@@ -574,19 +602,32 @@ def encontrar_frete(df_frete: pd.DataFrame, uf: str) -> Tuple[float, float]:
     if linha.empty:
         return 0.0, 0.0
 
+    # 1) Percentual (se existir e estiver preenchido)
     if col_perc:
         try:
-            perc = float(pd.to_numeric(linha.iloc[0][col_perc], errors="coerce"))
-            if perc > 1.0:
-                perc = perc / 100.0
-            return 0.0, max(0.0, perc)
+            raw = pd.to_numeric(linha.iloc[0][col_perc], errors="coerce")
+            if pd.notna(raw):
+                perc = _to_percent(float(raw))
+                if perc > 0:
+                    return 0.0, perc
         except Exception:
-            return 0.0, 0.0
+            pass
 
+    # 2) Valor (pode ser % disfarçado ou R$)
     if col_val:
         try:
-            val = float(pd.to_numeric(linha.iloc[0][col_val], errors="coerce"))
-            return max(0.0, val), 0.0
+            raw = pd.to_numeric(linha.iloc[0][col_val], errors="coerce")
+            if pd.isna(raw):
+                return 0.0, 0.0
+            v = float(raw)
+            if v > 0 and v < 1.0:
+                return 0.0, v  # percentual em decimal
+            # se veio 2.91 por exemplo, pode ser %; heurística:
+            colname = _norm_text(col_val)
+            if v > 0 and v <= 100.0 and ("%" in colname or "perc" in colname or "pct" in colname or "percent" in colname):
+                return 0.0, _to_percent(v)
+            # default: R$
+            return max(0.0, v), 0.0
         except Exception:
             return 0.0, 0.0
 
@@ -758,18 +799,14 @@ def tela_consulta_precos(supabase):
         preco_atual_c = 0.0
     ipi_perc = calcular_ipi_percent(preco_atual_s, preco_atual_c)
 
-    preco_sugerido_sem_ipi = calcular_preco_sugerido_sem_ipi(
-        cpv=cpv,
-        frete_valor=frete_valor,
-        frete_perc=frete_perc,
-        tributos=params["TRIBUTOS"],
-        devolucao=params["DEVOLUCAO"],
-        comissao=params["COMISSAO"],
-        mod=params["MOD"],
-        margem_alvo=params["MC_ALVO"],
-        vpc=vpc_cli,
-        aplicar_vpc=aplicar_vpc,
-    )
+    # Formação do preço
+    custo_com_mod = float(cpv) * (1.0 + float(params["MOD"]))
+    vpc_eff = vpc_cli if aplicar_vpc else 0.0
+    total_perc = float(params["TRIBUTOS"]) + float(params["DEVOLUCAO"]) + float(params["COMISSAO"]) + float(params["MC_ALVO"]) + float(frete_perc) + float(vpc_eff)
+    denominador = 1.0 - total_perc
+    numerador = custo_com_mod + float(frete_valor)
+
+    preco_sugerido_sem_ipi = 0.0 if denominador <= 0 else (numerador / denominador)
     preco_sugerido_com_ipi = preco_sugerido_sem_ipi * (1.0 + ipi_perc)
 
     apur = apurar_mc_ebitda(
@@ -815,18 +852,36 @@ def tela_consulta_precos(supabase):
             st.write(f"Produto (PROD): **{prod_sel}**")
             st.write(f"CODPRO: **{codpro}**")
             st.write(f"UF: **{uf}** | Frete valor: **{formatar_moeda(frete_valor)}** | Frete %: **{formatar_percent(frete_perc*100)}**")
-            st.write(f"Cliente: **{cliente}** | Aplicar VPC: **{aplicar_vpc}** | VPC: **{formatar_percent((vpc_cli if aplicar_vpc else 0.0)*100)}**")
+            st.write(f"Cliente: **{cliente}** | Aplicar VPC: **{aplicar_vpc}** | VPC: **{formatar_percent((vpc_eff)*100)}**")
+
             st.divider()
-            st.write("**Parâmetros (%):**")
-            st.write(f"- Tributos: {formatar_percent(params['TRIBUTOS']*100)}")
-            st.write(f"- Devolução: {formatar_percent(params['DEVOLUCAO']*100)}")
-            st.write(f"- Comissão: {formatar_percent(params['COMISSAO']*100)}")
-            st.write(f"- MOD: {formatar_percent(params['MOD']*100)}")
-            st.write(f"- Margem alvo: {formatar_percent(params['MC_ALVO']*100)}")
-            st.write(f"- Overhead: {formatar_percent(params['OVERHEAD']*100)}")
-            st.write(f"- Bonificação (sobre custo): {formatar_percent(params['BONIFICACAO_SOBRE_CUSTO']*100)}")
+            st.markdown("### 🔎 Formação do Preço (linha a linha)")
+
+            st.write("**1) Custo com MOD**")
+            st.write(f"- CPV (Inventário): {formatar_moeda(cpv)}")
+            st.write(f"- MOD%: {formatar_percent(float(params['MOD'])*100)} | MOD (R$): {formatar_moeda(float(cpv)*float(params['MOD']))}")
+            st.write(f"- Custo c/ MOD: {formatar_moeda(custo_com_mod)}")
+
+            st.write("**2) Percentuais do Gross-up (base receita)**")
+            st.write(f"- Tributos: {formatar_percent(float(params['TRIBUTOS'])*100)}")
+            st.write(f"- Devolução: {formatar_percent(float(params['DEVOLUCAO'])*100)}")
+            st.write(f"- Comissão: {formatar_percent(float(params['COMISSAO'])*100)}")
+            st.write(f"- Margem alvo (MC): {formatar_percent(float(params['MC_ALVO'])*100)}")
+            st.write(f"- VPC (condicional): {formatar_percent(float(vpc_eff)*100)}")
+            st.write(f"- Frete% (UF): {formatar_percent(float(frete_perc)*100)}")
+            st.write(f"➡️ **Total Custos Variáveis %** = {formatar_percent(total_perc*100)}")
+
+            st.write("**3) Cálculo do Preço s/ IPI (fórmula oficial)**")
+            st.write(f"- Numerador = Custo c/ MOD + Frete (R$) = {formatar_moeda(custo_com_mod)} + {formatar_moeda(frete_valor)} = **{formatar_moeda(numerador)}**")
+            st.write(f"- Denominador = 1 - Total% = 1 - {total_perc:.6f} = **{denominador:.6f}**")
+            st.write(f"➡️ **Preço s/ IPI** = Numerador / Denominador = **{formatar_moeda(preco_sugerido_sem_ipi)}**")
+
+            st.write("**4) Cálculo do Preço c/ IPI**")
+            st.write(f"- IPI% (derivado do preço atual): {formatar_percent(ipi_perc*100)}")
+            st.write(f"➡️ **Preço c/ IPI** = Preço s/ IPI × (1 + IPI%) = **{formatar_moeda(preco_sugerido_com_ipi)}**")
+
             st.divider()
-            st.write("**Apuração (R$):**")
+            st.markdown("### 🧾 Apuração (R$)")
             st.write(f"- Receita líquida: {formatar_moeda(apur['receita_liquida'])}")
             st.write(f"- Custos variáveis: {formatar_moeda(apur['custo_variavel_total'])}")
             st.write(f"- Overhead: {formatar_moeda(apur['overhead_valor'])}")
@@ -927,10 +982,10 @@ Versão: **{__version__}**
 Release: **{__release_date__}**
 
 **Destaques**
-- Salvamento robusto de parâmetros (config_parametros / fallback JSON)
+- Frete híbrido (R$ ou %) com heurística anti-zero
+- Formação do preço linha a linha (ADM/Master)
 - Bases sob demanda (performance)
 - Google Drive + OneDrive/SharePoint
-- Auditoria somente ADM/Master
 """
     )
 
