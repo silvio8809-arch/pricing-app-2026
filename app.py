@@ -19,12 +19,12 @@ import requests
 
 # ==================== VERSÃO (LEAN) ====================
 APP_NAME = "Pricing 2026"
-__version__ = "3.5.2"
+__version__ = "3.5.3"
 __release_date__ = "2026-02-10"
 __last_changes__ = [
-    "Biblioteca DE→PARA: colunas equivalentes entre bases (ex.: SKU=Produto=CODPRO)",
-    "Normalização forte de nomes de colunas (acentos/pontuação/espaços)",
-    "pick_col() agora resolve sinônimos automaticamente via DEPARA",
+    "Correção NameError: adicionada função normalizar_texto()",
+    "Consulta agora permite buscar por SKU OU por Descrição (lista SKU - Descrição)",
+    "Tela exibe a Descrição do SKU selecionado (sem quebrar caso esteja vazia)",
 ]
 
 # ==================== CONFIGURAÇÃO INICIAL ====================
@@ -90,29 +90,32 @@ def formatar_pct(frac: float) -> str:
     return "{0:.2f}%".format(float(frac) * 100)
 
 
+def normalizar_texto(s: object) -> str:
+    """Evita quebra quando o campo vem NaN/None/numérico e padroniza texto."""
+    try:
+        if s is None:
+            return ""
+        if isinstance(s, float) and pd.isna(s):
+            return ""
+        txt = str(s)
+        txt = re.sub(r"\s+", " ", txt).strip()
+        return txt
+    except Exception:
+        return ""
+
+
 # ==================== DE→PARA (Governança de Dados) ====================
-# Chaves = "conceito canônico" | valores = sinônimos aceitos em qualquer base
 DEPARA_COLUNAS: Dict[str, List[str]] = {
-    # Identificadores
     "SKU": ["SKU", "Produto", "CODPRO", "CodPro", "Código do Produto", "Codigo do Produto", "Codigo", "Código", "COD", "Cód"],
     "DESCRICAO": ["Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto", "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto", "Produto Descrição"],
-
-    # Preço
     "PRECO": ["Preço", "Preco", "Preço Atual", "Preco Atual", "Preço Venda", "Preco Venda", "PV", "Preço Sem IPI", "Preco Sem IPI"],
-
-    # Custos
     "CUSTO_INVENTARIO": ["Custo Inventário", "Custo Inventario", "Custo", "CMV", "CPV", "Custo Produto", "Custo Mercadoria"],
-
-    # Frete
     "UF": ["UF", "Estado", "Destino", "UF Destino"],
     "FRETE_VALOR": ["Valor", "Frete", "Custo Frete", "Custo do Frete", "Valor Frete", "Custo"],
-
-    # Cliente / VPC
     "CLIENTE": ["Cliente", "Nome", "Nome do Cliente", "Razão Social", "Razao Social", "Cliente Nome", "CNPJ"],
     "VPC": ["VPC", "VPC%", "VPC %", "Percentual", "Perc", "Desconto", "Desconto%", "VPC Perc", "VPC Percentual"],
 }
 
-# Algumas variações comuns que podem aparecer (abreviações e “sujeira”)
 EXTRAS_SINONIMOS = {
     "SKU": ["CODPROD", "COD_PROD", "COD PROD", "CODIGO PRODUTO", "CODIGO_PRODUTO"],
     "PRECO": ["PRECO_VENDA", "PRECO VENDA", "PRECO ATUAL", "PV SEM IPI"],
@@ -122,13 +125,6 @@ EXTRAS_SINONIMOS = {
 
 
 def normalizar_chave(texto: str) -> str:
-    """
-    Normaliza para comparação:
-    - remove acentos
-    - transforma em maiúsculo
-    - remove pontuação
-    - troca múltiplos espaços por 1
-    """
     s = str(texto or "").strip()
     s = unicodedata.normalize("NFKD", s)
     s = "".join([c for c in s if not unicodedata.combining(c)])
@@ -139,10 +135,6 @@ def normalizar_chave(texto: str) -> str:
 
 
 def expandir_candidatos(candidatos: List[str]) -> List[str]:
-    """
-    Recebe lista de 'conceitos' ou nomes e expande via DEPARA.
-    Ex.: ["SKU"] vira ["SKU","Produto","CODPRO",...]
-    """
     expanded: List[str] = []
     for c in candidatos:
         key = str(c).strip().upper()
@@ -152,9 +144,9 @@ def expandir_candidatos(candidatos: List[str]) -> List[str]:
                 expanded.extend(EXTRAS_SINONIMOS[key])
         else:
             expanded.append(c)
-    # remove duplicados preservando ordem
+
     seen = set()
-    out = []
+    out: List[str] = []
     for x in expanded:
         nx = normalizar_chave(x)
         if nx not in seen:
@@ -164,27 +156,17 @@ def expandir_candidatos(candidatos: List[str]) -> List[str]:
 
 
 def pick_col(df: pd.DataFrame, candidatos: List[str]) -> Optional[str]:
-    """
-    Resolve coluna usando:
-    1) normalização forte
-    2) expansão via DEPARA
-    """
     if df is None or df.empty:
         return None
 
-    # mapa de colunas reais normalizadas -> nome original
     mapa = {normalizar_chave(c): c for c in df.columns}
-
-    # expande candidatos via DEPARA
     candidatos_expand = expandir_candidatos(candidatos)
 
-    # tenta match por normalização
     for cand in candidatos_expand:
         k = normalizar_chave(cand)
         if k in mapa:
             return mapa[k]
 
-    # fallback: match parcial (ex.: "DESCRICAO" dentro do nome)
     for cand in candidatos_expand:
         k = normalizar_chave(cand)
         for col_norm, col_real in mapa.items():
@@ -513,7 +495,7 @@ class CalculadoraAMVOX:
         }
 
 
-# ==================== CONSULTAS (usam DEPARA) ====================
+# ==================== CONSULTAS (SKU/Descrição) ====================
 def get_price_from_df_precos(df_precos: pd.DataFrame, sku: str) -> Optional[float]:
     col_sku = pick_col(df_precos, ["SKU"])
     col_preco = pick_col(df_precos, ["PRECO"])
@@ -599,6 +581,43 @@ def listar_clientes(df_vpc: pd.DataFrame) -> List[str]:
     return [v for v in vals if v.strip()]
 
 
+def construir_lista_sku_descricao(df_precos: pd.DataFrame) -> Tuple[List[str], Dict[str, str]]:
+    """
+    Retorna:
+      - lista de opções: ["SKU - Descrição", ...]
+      - mapa: "SKU - Descrição" -> SKU
+    """
+    col_sku = pick_col(df_precos, ["SKU"])
+    col_desc = pick_col(df_precos, ["DESCRICAO"])
+
+    if not col_sku:
+        return [], {}
+
+    df = df_precos.copy()
+    df[col_sku] = df[col_sku].astype(str)
+
+    if col_desc:
+        df[col_desc] = df[col_desc].apply(normalizar_texto)
+    else:
+        df["_DESC_FAKE_"] = ""
+        col_desc = "_DESC_FAKE_"
+
+    df = df[[col_sku, col_desc]].drop_duplicates()
+    df[col_desc] = df[col_desc].fillna("").astype(str)
+
+    opcoes: List[str] = []
+    mapa: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        sku = normalizar_texto(row[col_sku])
+        desc = normalizar_texto(row[col_desc])
+        label = sku + " - " + (desc if desc else "(sem descrição)")
+        opcoes.append(label)
+        mapa[label] = sku
+
+    opcoes = sorted(opcoes)
+    return opcoes, mapa
+
+
 # ==================== TELAS ====================
 def inicializar_sessao():
     defaults = {"autenticado": False, "perfil": Config.PERFIL_VENDEDOR, "email": "", "nome": "Usuário"}
@@ -662,22 +681,27 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
             st.info("💡 Vá em **⚙️ Configurações** para corrigir links e/ou parâmetros.")
         return
 
-    col_sku_precos = pick_col(df_precos, ["SKU"])
-    if not col_sku_precos:
+    # === NOVO: lista SKU - Descrição para permitir consulta por ambos ===
+    opcoes, mapa_label_para_sku = construir_lista_sku_descricao(df_precos)
+    if not opcoes:
         st.error("❌ Base 'Preços Atuais' sem coluna SKU/Produto/CODPRO (ou equivalente).")
         return
-
-    skus = sorted(df_precos[col_sku_precos].astype(str).dropna().unique().tolist())
-    skus = [s for s in skus if s.strip()]
 
     st.divider()
     st.subheader("📌 Parâmetros de consulta")
 
-    col_a, col_b, col_c = st.columns([2, 2, 2])
+    col_a, col_b, col_c = st.columns([3, 2, 2])
+
     with col_a:
-        sku = st.selectbox("SKU / Produto / CODPRO", options=["Selecione..."] + skus)
+        selecao = st.selectbox("Buscar por SKU ou Descrição", options=["Selecione..."] + opcoes)
+        if selecao == "Selecione...":
+            st.info("💡 Selecione um item (SKU - Descrição) para consultar.")
+            return
+        sku = mapa_label_para_sku.get(selecao, "")
+
     with col_b:
         modo = st.radio("Base de destino", options=["UF destino", "Cliente"], horizontal=True)
+
     with col_c:
         if modo == "UF destino":
             uf = st.selectbox("UF destino", options=Config.UFS_BRASIL)
@@ -687,13 +711,12 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
             cliente = st.selectbox("Cliente / Nome", options=["Selecione..."] + clientes) if clientes else "Selecione..."
             uf = st.selectbox("UF destino (fallback)", options=Config.UFS_BRASIL)
 
-    if sku == "Selecione...":
-        st.info("💡 Selecione um SKU/Produto/CODPRO.")
-        return
+    # === Mostra a descrição (SLA de usabilidade) ===
+    desc = get_desc_from_df_precos(df_precos, sku)
+    st.caption("SKU selecionado: **" + sku + "** | Descrição: **" + (desc if desc else "(sem descrição)") + "**")
 
     preco_atual = get_price_from_df_precos(df_precos, sku)
     custo_inv = get_custo_inventario(df_inv, sku)
-    desc = get_desc_from_df_precos(df_precos, sku)
 
     if preco_atual is None:
         st.error("❌ Não achei a coluna de preço na base 'Preços Atuais' (Preço/Preço Atual/PV...).")
@@ -726,8 +749,7 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric("Preço (Base Preços)", formatar_moeda(res["preco_bruto"]))
-        if desc:
-            st.caption("Descrição: " + desc[:120])
+        st.caption("Descrição: " + (desc if desc else "(sem descrição)"))
     with m2:
         st.metric("Receita Base (pós VPC)", formatar_moeda(res["receita_base"]))
     with m3:
