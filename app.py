@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 import socket
+import unicodedata
 from datetime import datetime
 from io import BytesIO
 from typing import Tuple, Dict, Optional, List
@@ -18,12 +19,12 @@ import requests
 
 # ==================== VERSÃO (LEAN) ====================
 APP_NAME = "Pricing 2026"
-__version__ = "3.5.1"
+__version__ = "3.5.2"
 __release_date__ = "2026-02-10"
 __last_changes__ = [
-    "Correção Streamlit cache: parâmetros supabase não-hashable (UnhashableParamError)",
-    "Funções cacheadas agora usam _supabase (Streamlit ignora no hash)",
-    "Mantida tela Consulta de Preços + Config Parâmetros + suporte Drive/Sheets/OneDrive",
+    "Biblioteca DE→PARA: colunas equivalentes entre bases (ex.: SKU=Produto=CODPRO)",
+    "Normalização forte de nomes de colunas (acentos/pontuação/espaços)",
+    "pick_col() agora resolve sinônimos automaticamente via DEPARA",
 ]
 
 # ==================== CONFIGURAÇÃO INICIAL ====================
@@ -34,7 +35,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ==================== CONSTANTES / GOVERNANÇA ====================
+# ==================== GOVERNANÇA / DEFAULTS ====================
 class Config:
     CACHE_TTL = 300  # 5 minutos
 
@@ -60,7 +61,6 @@ class Config:
     }
 
 
-# ==================== HELPERS ====================
 def is_admin() -> bool:
     return st.session_state.get("perfil") in Config.PERFIS_ADMIN
 
@@ -90,8 +90,108 @@ def formatar_pct(frac: float) -> str:
     return "{0:.2f}%".format(float(frac) * 100)
 
 
-def normalizar_texto(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s or "").strip())
+# ==================== DE→PARA (Governança de Dados) ====================
+# Chaves = "conceito canônico" | valores = sinônimos aceitos em qualquer base
+DEPARA_COLUNAS: Dict[str, List[str]] = {
+    # Identificadores
+    "SKU": ["SKU", "Produto", "CODPRO", "CodPro", "Código do Produto", "Codigo do Produto", "Codigo", "Código", "COD", "Cód"],
+    "DESCRICAO": ["Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto", "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto", "Produto Descrição"],
+
+    # Preço
+    "PRECO": ["Preço", "Preco", "Preço Atual", "Preco Atual", "Preço Venda", "Preco Venda", "PV", "Preço Sem IPI", "Preco Sem IPI"],
+
+    # Custos
+    "CUSTO_INVENTARIO": ["Custo Inventário", "Custo Inventario", "Custo", "CMV", "CPV", "Custo Produto", "Custo Mercadoria"],
+
+    # Frete
+    "UF": ["UF", "Estado", "Destino", "UF Destino"],
+    "FRETE_VALOR": ["Valor", "Frete", "Custo Frete", "Custo do Frete", "Valor Frete", "Custo"],
+
+    # Cliente / VPC
+    "CLIENTE": ["Cliente", "Nome", "Nome do Cliente", "Razão Social", "Razao Social", "Cliente Nome", "CNPJ"],
+    "VPC": ["VPC", "VPC%", "VPC %", "Percentual", "Perc", "Desconto", "Desconto%", "VPC Perc", "VPC Percentual"],
+}
+
+# Algumas variações comuns que podem aparecer (abreviações e “sujeira”)
+EXTRAS_SINONIMOS = {
+    "SKU": ["CODPROD", "COD_PROD", "COD PROD", "CODIGO PRODUTO", "CODIGO_PRODUTO"],
+    "PRECO": ["PRECO_VENDA", "PRECO VENDA", "PRECO ATUAL", "PV SEM IPI"],
+    "CUSTO_INVENTARIO": ["CUSTO_INV", "CUSTO INV", "CUSTO MEDIO", "CUSTO MÉDIO"],
+    "CLIENTE": ["NOMECLIENTE", "NOME CLIENTE"],
+}
+
+
+def normalizar_chave(texto: str) -> str:
+    """
+    Normaliza para comparação:
+    - remove acentos
+    - transforma em maiúsculo
+    - remove pontuação
+    - troca múltiplos espaços por 1
+    """
+    s = str(texto or "").strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join([c for c in s if not unicodedata.combining(c)])
+    s = s.upper()
+    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def expandir_candidatos(candidatos: List[str]) -> List[str]:
+    """
+    Recebe lista de 'conceitos' ou nomes e expande via DEPARA.
+    Ex.: ["SKU"] vira ["SKU","Produto","CODPRO",...]
+    """
+    expanded: List[str] = []
+    for c in candidatos:
+        key = str(c).strip().upper()
+        if key in DEPARA_COLUNAS:
+            expanded.extend(DEPARA_COLUNAS[key])
+            if key in EXTRAS_SINONIMOS:
+                expanded.extend(EXTRAS_SINONIMOS[key])
+        else:
+            expanded.append(c)
+    # remove duplicados preservando ordem
+    seen = set()
+    out = []
+    for x in expanded:
+        nx = normalizar_chave(x)
+        if nx not in seen:
+            seen.add(nx)
+            out.append(x)
+    return out
+
+
+def pick_col(df: pd.DataFrame, candidatos: List[str]) -> Optional[str]:
+    """
+    Resolve coluna usando:
+    1) normalização forte
+    2) expansão via DEPARA
+    """
+    if df is None or df.empty:
+        return None
+
+    # mapa de colunas reais normalizadas -> nome original
+    mapa = {normalizar_chave(c): c for c in df.columns}
+
+    # expande candidatos via DEPARA
+    candidatos_expand = expandir_candidatos(candidatos)
+
+    # tenta match por normalização
+    for cand in candidatos_expand:
+        k = normalizar_chave(cand)
+        if k in mapa:
+            return mapa[k]
+
+    # fallback: match parcial (ex.: "DESCRICAO" dentro do nome)
+    for cand in candidatos_expand:
+        k = normalizar_chave(cand)
+        for col_norm, col_real in mapa.items():
+            if k and (k in col_norm or col_norm in k):
+                return col_real
+
+    return None
 
 
 # ==================== SUPABASE ====================
@@ -165,7 +265,6 @@ def salvar_parametro(supabase, nome: str, valor_percentual: float, grupo: str = 
         return False, tradutor_erro(e)
 
 
-# ✅ IMPORTANTE: parâmetro começa com "_" para o Streamlit NÃO tentar hash do client
 @st.cache_data(ttl=Config.CACHE_TTL)
 def carregar_links(_supabase) -> Dict[str, str]:
     try:
@@ -175,7 +274,6 @@ def carregar_links(_supabase) -> Dict[str, str]:
         return {}
 
 
-# ✅ IMPORTANTE: parâmetro começa com "_" para o Streamlit NÃO tentar hash do client
 @st.cache_data(ttl=Config.CACHE_TTL)
 def carregar_parametros(_supabase) -> Dict[str, float]:
     params = dict(Config.DEFAULT_PARAMS)
@@ -415,24 +513,11 @@ class CalculadoraAMVOX:
         }
 
 
-# ==================== EXTRAÇÃO DE COLUNAS (ROBUSTO) ====================
-def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    for cand in candidates:
-        key = cand.strip().lower()
-        if key in cols:
-            return cols[key]
-    return None
-
-
+# ==================== CONSULTAS (usam DEPARA) ====================
 def get_price_from_df_precos(df_precos: pd.DataFrame, sku: str) -> Optional[float]:
-    if df_precos.empty:
-        return None
-    col_sku = pick_col(df_precos, ["SKU", "codigo", "código", "cod", "cód"])
-    if not col_sku:
-        return None
-    col_preco = pick_col(df_precos, ["Preço", "Preco", "Preço Atual", "Preco Atual", "Preço Venda", "Preco Venda", "PV", "Preço Sem IPI", "Preco Sem IPI"])
-    if not col_preco:
+    col_sku = pick_col(df_precos, ["SKU"])
+    col_preco = pick_col(df_precos, ["PRECO"])
+    if not col_sku or not col_preco:
         return None
     linha = df_precos[df_precos[col_sku].astype(str) == str(sku)]
     if linha.empty:
@@ -444,10 +529,8 @@ def get_price_from_df_precos(df_precos: pd.DataFrame, sku: str) -> Optional[floa
 
 
 def get_desc_from_df_precos(df_precos: pd.DataFrame, sku: str) -> str:
-    if df_precos.empty:
-        return ""
-    col_sku = pick_col(df_precos, ["SKU", "codigo", "código", "cod", "cód"])
-    col_desc = pick_col(df_precos, ["Descrição", "Descricao", "DESCRICAO", "Produto", "Nome", "Item"])
+    col_sku = pick_col(df_precos, ["SKU"])
+    col_desc = pick_col(df_precos, ["DESCRICAO"])
     if not col_sku or not col_desc:
         return ""
     linha = df_precos[df_precos[col_sku].astype(str) == str(sku)]
@@ -457,10 +540,8 @@ def get_desc_from_df_precos(df_precos: pd.DataFrame, sku: str) -> str:
 
 
 def get_custo_inventario(df_inv: pd.DataFrame, sku: str) -> Optional[float]:
-    if df_inv.empty:
-        return None
-    col_sku = pick_col(df_inv, ["SKU", "codigo", "código", "cod", "cód"])
-    col_custo = pick_col(df_inv, ["Custo Inventário", "Custo Inventario", "Custo", "CMV", "CPV"])
+    col_sku = pick_col(df_inv, ["SKU"])
+    col_custo = pick_col(df_inv, ["CUSTO_INVENTARIO"])
     if not col_sku or not col_custo:
         return None
     linha = df_inv[df_inv[col_sku].astype(str) == str(sku)]
@@ -473,10 +554,8 @@ def get_custo_inventario(df_inv: pd.DataFrame, sku: str) -> Optional[float]:
 
 
 def get_frete_uf(df_frete: pd.DataFrame, uf: str) -> float:
-    if df_frete.empty:
-        return 0.0
-    col_uf = pick_col(df_frete, ["UF", "Estado", "Destino"])
-    col_val = pick_col(df_frete, ["Valor", "Frete", "Custo Frete", "Custo", "Valor Frete"])
+    col_uf = pick_col(df_frete, ["UF"])
+    col_val = pick_col(df_frete, ["FRETE_VALOR"])
     if not col_uf or not col_val:
         return 0.0
     linha = df_frete[df_frete[col_uf].astype(str).str.upper() == str(uf).upper()]
@@ -489,11 +568,9 @@ def get_frete_uf(df_frete: pd.DataFrame, uf: str) -> float:
 
 
 def get_vpc_cliente(df_vpc: pd.DataFrame, cliente: str, sku: Optional[str] = None) -> float:
-    if df_vpc.empty:
-        return 0.0
-    col_cliente = pick_col(df_vpc, ["Cliente", "CNPJ", "Razão Social", "Razao Social", "Cliente Nome", "Nome"])
-    col_vpc = pick_col(df_vpc, ["VPC", "VPC%", "VPC %", "Percentual", "Perc", "Desconto", "Desconto%"])
-    col_sku = pick_col(df_vpc, ["SKU", "codigo", "código", "cod", "cód"])
+    col_cliente = pick_col(df_vpc, ["CLIENTE"])
+    col_vpc = pick_col(df_vpc, ["VPC"])
+    col_sku = pick_col(df_vpc, ["SKU"])
     if not col_cliente or not col_vpc:
         return 0.0
 
@@ -505,7 +582,6 @@ def get_vpc_cliente(df_vpc: pd.DataFrame, cliente: str, sku: Optional[str] = Non
 
     if base.empty:
         return 0.0
-
     try:
         v = float(base[col_vpc].values[0])
         if v > 1.0:
@@ -516,9 +592,7 @@ def get_vpc_cliente(df_vpc: pd.DataFrame, cliente: str, sku: Optional[str] = Non
 
 
 def listar_clientes(df_vpc: pd.DataFrame) -> List[str]:
-    if df_vpc.empty:
-        return []
-    col_cliente = pick_col(df_vpc, ["Cliente", "CNPJ", "Razão Social", "Razao Social", "Cliente Nome", "Nome"])
+    col_cliente = pick_col(df_vpc, ["CLIENTE"])
     if not col_cliente:
         return []
     vals = sorted(df_vpc[col_cliente].astype(str).dropna().unique().tolist())
@@ -588,9 +662,9 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
             st.info("💡 Vá em **⚙️ Configurações** para corrigir links e/ou parâmetros.")
         return
 
-    col_sku_precos = pick_col(df_precos, ["SKU", "codigo", "código", "cod", "cód"])
+    col_sku_precos = pick_col(df_precos, ["SKU"])
     if not col_sku_precos:
-        st.error("❌ Base 'Preços Atuais' sem coluna SKU (ou equivalente). Padronize a coluna como 'SKU'.")
+        st.error("❌ Base 'Preços Atuais' sem coluna SKU/Produto/CODPRO (ou equivalente).")
         return
 
     skus = sorted(df_precos[col_sku_precos].astype(str).dropna().unique().tolist())
@@ -600,31 +674,21 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
     st.subheader("📌 Parâmetros de consulta")
 
     col_a, col_b, col_c = st.columns([2, 2, 2])
-
     with col_a:
-        sku = st.selectbox("SKU", options=["Selecione..."] + skus)
-
+        sku = st.selectbox("SKU / Produto / CODPRO", options=["Selecione..."] + skus)
     with col_b:
         modo = st.radio("Base de destino", options=["UF destino", "Cliente"], horizontal=True)
-
     with col_c:
-        uf = None
-        cliente = None
-
         if modo == "UF destino":
             uf = st.selectbox("UF destino", options=Config.UFS_BRASIL)
+            cliente = None
         else:
             clientes = listar_clientes(df_vpc)
-            if clientes:
-                cliente = st.selectbox("Cliente", options=["Selecione..."] + clientes)
-            else:
-                st.warning("⚠️ Base 'VPC por cliente' não possui coluna Cliente (ou está vazia).")
-                cliente = "Selecione..."
-
+            cliente = st.selectbox("Cliente / Nome", options=["Selecione..."] + clientes) if clientes else "Selecione..."
             uf = st.selectbox("UF destino (fallback)", options=Config.UFS_BRASIL)
 
     if sku == "Selecione...":
-        st.info("💡 Selecione um SKU para consultar.")
+        st.info("💡 Selecione um SKU/Produto/CODPRO.")
         return
 
     preco_atual = get_price_from_df_precos(df_precos, sku)
@@ -632,11 +696,10 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
     desc = get_desc_from_df_precos(df_precos, sku)
 
     if preco_atual is None:
-        st.error("❌ Não foi possível localizar a coluna de preço na base 'Preços Atuais'. Padronize como 'Preço' ou 'Preço Atual'.")
+        st.error("❌ Não achei a coluna de preço na base 'Preços Atuais' (Preço/Preço Atual/PV...).")
         return
-
     if custo_inv is None:
-        st.error("❌ Não foi possível localizar 'Custo Inventário' (ou equivalente) na base 'Inventário'. Padronize como 'Custo Inventário'.")
+        st.error("❌ Não achei a coluna de custo na base 'Inventário' (Custo Inventário/CMV/CPV...).")
         return
 
     frete_uf = get_frete_uf(df_frete, uf or "")
@@ -662,7 +725,7 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("Preço (Base Preços Atuais)", formatar_moeda(res["preco_bruto"]))
+        st.metric("Preço (Base Preços)", formatar_moeda(res["preco_bruto"]))
         if desc:
             st.caption("Descrição: " + desc[:120])
     with m2:
@@ -679,27 +742,6 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
     else:
         st.success("✅ MC dentro do alvo: " + formatar_pct(res["mc_pct"]) + " ≥ " + formatar_pct(mc_alvo))
 
-    with st.expander("🧾 Detalhamento técnico (custos e componentes)"):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**Receita**")
-            st.write("- Preço bruto: " + formatar_moeda(res["preco_bruto"]))
-            st.write("- VPC aplicado: " + formatar_pct(res["vpc_pct"]))
-            st.write("- Receita base: " + formatar_moeda(res["receita_base"]))
-            st.write("- Receita líquida (pós tributos): " + formatar_moeda(res["receita_liquida"]))
-        with c2:
-            st.write("**Custos Variáveis**")
-            st.write("- Custo inventário: " + formatar_moeda(res["custo_inventario"]))
-            st.write("- MOD (sobre custo): " + formatar_moeda(res["custo_mod"]))
-            st.write("- Bonificação (sobre custo): " + formatar_moeda(res["custo_bonificacao"]))
-            st.write("- Frete UF: " + formatar_moeda(res["frete_uf"]))
-            st.write("- Devolução (sobre receita): " + formatar_moeda(res["custo_devolucao"]))
-            st.write("- Comissão (sobre receita): " + formatar_moeda(res["custo_comissao"]))
-            st.write("- **Total custos variáveis:** " + formatar_moeda(res["custos_variaveis"]))
-            st.divider()
-            st.write("**Overhead (fixo)**")
-            st.write("- Overhead: " + formatar_moeda(res["overhead_val"]))
-
 
 def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]):
     st.title("⚙️ Configurações (ADM/Master)")
@@ -707,17 +749,15 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
         st.warning("⚠️ Acesso restrito a usuários ADM/Master")
         return
 
-    tab1, tab2 = st.tabs(["🔗 Links das Bases", "🧩 Parâmetros de Precificação"])
+    tab1, tab2, tab3 = st.tabs(["🔗 Links das Bases", "🧩 Parâmetros de Precificação", "🧠 DE→PARA (Colunas)"])
 
     with tab1:
-        st.info("Cole links do OneDrive/SharePoint ou Google Drive/Sheets. Os arquivos precisam estar públicos via link (Leitor).")
+        st.info("Cole links do OneDrive/SharePoint ou Google Drive/Sheets. Arquivos devem estar públicos via link (Leitor).")
         bases = ["Preços Atuais", "Inventário", "Frete", "VPC por cliente"]
-
         for base in bases:
             url_salva = links.get(base, "")
             with st.expander("📊 " + base, expanded=True):
                 link = st.text_area("Link da planilha", value=url_salva, key="link_" + base, height=110)
-
                 if link and link.strip():
                     link_limpo = link.strip()
                     plataforma = identificar_plataforma_link(link_limpo)
@@ -756,7 +796,6 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
 
     with tab2:
         st.info("Parâmetros que intervêm no preço. Preenchimento manual, governado por ADM/Master.")
-
         col1, col2, col3 = st.columns(3)
         with col1:
             trib = st.number_input("Tributos sobre vendas (%)", 0.0, 100.0, float(params.get("TRIBUTOS", 0.15) * 100), 0.1)
@@ -780,7 +819,6 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
                 "OVERHEAD": overhead / 100.0,
                 "MC_ALVO": mc_alvo / 100.0,
             }
-
             falhas = []
             for nome, val in itens.items():
                 ok, msg = salvar_parametro(supabase, nome, val, grupo="PRECIFICACAO")
@@ -796,6 +834,11 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
                 st.cache_data.clear()
                 st.rerun()
 
+    with tab3:
+        st.info("DE→PARA corporativo: sinônimos de colunas reconhecidos entre bases.")
+        for k, v in DEPARA_COLUNAS.items():
+            st.write("**" + k + "**: " + ", ".join(v))
+
 
 def tela_sobre(params: Dict[str, float]):
     st.title("ℹ️ Sobre o Sistema")
@@ -803,13 +846,11 @@ def tela_sobre(params: Dict[str, float]):
     st.write("Últimas alterações:")
     for c in __last_changes__:
         st.write("- " + c)
-
     with st.expander("📌 Parâmetros vigentes (snapshot)"):
         for k in sorted(params.keys()):
             st.write(f"- {k}: {formatar_pct(params[k])}")
 
 
-# ==================== APP PRINCIPAL ====================
 def main():
     inicializar_sessao()
     supabase = init_connection()
@@ -818,8 +859,8 @@ def main():
         tela_login(supabase)
         return
 
-    links = carregar_links(supabase)          # supabase é ignorado no hash por causa do _supabase
-    params = carregar_parametros(supabase)    # supabase é ignorado no hash por causa do _supabase
+    links = carregar_links(supabase)
+    params = carregar_parametros(supabase)
 
     with st.sidebar:
         st.title("👤 " + str(st.session_state.get("nome")))
