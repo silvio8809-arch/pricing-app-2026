@@ -1,6 +1,6 @@
 """
 PRICING 2026 - Sistema de Precificação Corporativa
-Versão: 3.8.3
+Versão: 3.8.4
 Última Atualização: 2026-02-10
 """
 
@@ -21,12 +21,14 @@ import requests
 
 # ==================== VERSÃO (LEAN) ====================
 APP_NAME = "Pricing 2026"
-__version__ = "3.8.3"
+__version__ = "3.8.4"
 __release_date__ = "2026-02-10"
 __last_changes__ = [
-    "Consulta: usuário seleciona APENAS pela descrição (sem código visível)",
-    "Chave interna: usa CODPRO (quando existir) para buscar custo e demais cálculos",
-    "Fallback inteligente: se CODPRO vier numérico/encurtado, recupera código pelo prefixo do PROD",
+    "Restore baseline estável: abas Simulador, Consulta, Configurações, Sobre",
+    "Consulta: seleção por descrição (sem SKU visível), usando CODPRO como chave interna",
+    "Persistência da última consulta ao trocar de tela",
+    "Links: suporte OneDrive/SharePoint + Google Drive/Sheets (download/export automático)",
+    "Perfis: ADM e Master com mesmo nível de acesso",
 ]
 
 # ==================== CONFIGURAÇÃO INICIAL ====================
@@ -52,12 +54,13 @@ class Config:
         "AP", "TO", "PI", "RN", "PB", "AL", "SE",
     ]
 
+    # Defaults (podem ser atualizados via tabela config_parametros, se existir)
     DEFAULT_PARAMS = {
         "TRIBUTOS": 0.15,
         "DEVOLUCAO": 0.03,
         "COMISSAO": 0.03,
         "BONIFICACAO": 0.01,   # base receita
-        "MC_ALVO": 0.09,       # base receita
+        "MC_ALVO": 0.09,       # base receita (meta)
         "MOD": 0.01,           # base custo
         "OVERHEAD": 0.16,      # fora do preço (impacta EBITDA)
     }
@@ -107,16 +110,20 @@ DEPARA_COLUNAS: Dict[str, List[str]] = {
     "PROD": ["PROD", "Produto/Descrição", "Produto Descrição", "Descricao Concatenada", "SKU + Descrição", "SKU+Descrição"],
     "DESCRICAO": ["Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto", "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto"],
 
-    # Inventário (Custo)
+    # Inventário (Custo) — conforme você determinou: a coluna é CUSTO (mas aceitamos sinônimos)
     "CUSTO_INVENTARIO": [
         "CUSTO", "Custo", "Custo Inventário", "Custo Inventario", "Custo do Produto",
-        "CMV", "CPV", "Custo dos produtos/Mercadorias", "Custo Mercadoria"
+        "CMV", "CPV", "Custo dos produtos/Mercadorias", "Custo Mercadoria", "Custo Mercadorias"
     ],
 
+    # Frete — pode vir como % (preferencial) ou valor (fallback)
     "UF": ["UF", "Estado", "Destino", "UF Destino"],
     "FRETE_PCT": ["Frete%", "Frete %", "Percentual Frete", "Perc Frete", "FRETE_PCT"],
+    "FRETE_VALOR": ["Frete", "Valor", "Valor Frete", "Frete Valor"],
+
     "CLIENTE": ["Cliente", "Nome", "Nome do Cliente", "Razão Social", "Razao Social", "CNPJ"],
     "VPC": ["VPC", "VPC%", "VPC %", "Percentual", "Desconto", "Desconto%"],
+
     "PRECO_ATUAL_SEM_IPI": ["PREÇO ATUAL S/ IPI", "PRECO ATUAL S/ IPI", "PREÇO ATUAL SEM IPI", "PRECO ATUAL SEM IPI"],
     "PRECO_ATUAL_COM_IPI": ["PREÇO ATUAL C/ IPI", "PRECO ATUAL C/ IPI", "PREÇO ATUAL COM IPI", "PRECO ATUAL COM IPI"],
 }
@@ -188,9 +195,6 @@ def cod_from_prod(prod: str) -> str:
 
 
 def norm_cod(valor: object) -> str:
-    """
-    Normaliza código, removendo efeitos comuns do Excel (ex.: 123.0).
-    """
     s = normalizar_texto(valor)
     if not s:
         return ""
@@ -201,8 +205,8 @@ def norm_cod(valor: object) -> str:
 
 def descricao_from_prod(prod: str, codpro: str) -> str:
     """
-    Remove o prefixo 'CODPRO -' ou 'CODPRO-' de PROD, deixando só descrição.
-    Se não casar, devolve PROD sem o código inicial (se houver).
+    Remove "CODPRO - " do PROD, deixando só a descrição.
+    Se não casar, remove o primeiro token antes do hífen.
     """
     p = normalizar_texto(prod)
     c = normalizar_texto(codpro)
@@ -210,14 +214,11 @@ def descricao_from_prod(prod: str, codpro: str) -> str:
         return ""
 
     if c:
-        # remove "COD - " ou "COD-"
         pat = r"^\s*" + re.escape(c) + r"\s*-\s*"
         desc = re.sub(pat, "", p, flags=re.IGNORECASE).strip()
         if desc and desc != p:
             return desc
 
-    # fallback: remove o primeiro token antes do hífen
-    # ex: "000503A94-SKD CAIXA..." -> "SKD CAIXA..."
     if "-" in p:
         parts = p.split("-", 1)
         if len(parts) == 2:
@@ -227,10 +228,7 @@ def descricao_from_prod(prod: str, codpro: str) -> str:
 
 
 def option_unico_visual(texto: str, idx: int) -> str:
-    """
-    Garante unicidade no selectbox sem poluir a tela:
-    adiciona caractere invisível (zero-width) no final quando necessário.
-    """
+    # garante unicidade no selectbox sem sujar tela
     return texto + ("\u200b" * idx)
 
 
@@ -298,6 +296,7 @@ def carregar_links(supabase) -> Dict[str, str]:
 
 
 def carregar_parametros(supabase) -> Dict[str, float]:
+    # não cachear isso com supabase como arg (evita UnhashableParamError)
     params = dict(Config.DEFAULT_PARAMS)
     try:
         resp = supabase.table("config_parametros").select("*").execute()
@@ -477,56 +476,94 @@ def autenticar_usuario(supabase, email: str, senha: str) -> Tuple[bool, Optional
         return False, None
 
 
-# ==================== REGRA DE NEGÓCIO (FÓRMULA OFICIAL) ====================
-class PrecificacaoOficialAMVOX:
+# ==================== MOTOR FINANCEIRO ====================
+class MotorPrecificacao:
     @staticmethod
-    def calcular_preco_sugerido_sem_ipi(
-        cpv: float,
-        frete_pct: float,
-        params: Dict[str, float],
-        aplicar_vpc: bool,
-        vpc_pct: float,
-    ) -> float:
+    def calcular_metricas(preco_sem_ipi: float, cpv: float, frete_valor: float, params: Dict[str, float]) -> Dict[str, float]:
+        """
+        MC e EBITDA (modelo do app):
+          Receita líquida = Preço * (1 - Tributos)
+          Custos variáveis = CPV*(1+MOD) + frete + devol + comissão + bonificação
+          MC = Receita líquida - Custos variáveis
+          EBITDA = MC - (Overhead * Preço)
+        """
         trib = float(params.get("TRIBUTOS", 0.15))
         devol = float(params.get("DEVOLUCAO", 0.03))
         comis = float(params.get("COMISSAO", 0.03))
         bon = float(params.get("BONIFICACAO", 0.01))
-        mc_alvo = float(params.get("MC_ALVO", 0.09))
+        mod = float(params.get("MOD", 0.01))
+        overhead = float(params.get("OVERHEAD", 0.16))
+
+        receita_liq = preco_sem_ipi * (1.0 - trib)
+
+        custo_mod = cpv * (1.0 + mod)
+        custo_devol = preco_sem_ipi * devol
+        custo_comis = preco_sem_ipi * comis
+        custo_bon = preco_sem_ipi * bon
+
+        custo_var = custo_mod + frete_valor + custo_devol + custo_comis + custo_bon
+
+        mc = receita_liq - custo_var
+        ebitda = mc - (preco_sem_ipi * overhead)
+
+        perc_mc = (mc / preco_sem_ipi * 100.0) if preco_sem_ipi > 0 else 0.0
+        perc_ebitda = (ebitda / preco_sem_ipi * 100.0) if preco_sem_ipi > 0 else 0.0
+
+        return {
+            "receita_liquida": receita_liq,
+            "custo_variavel_total": custo_var,
+            "mc": mc,
+            "ebitda": ebitda,
+            "perc_mc": perc_mc,
+            "perc_ebitda": perc_ebitda,
+            "frete_valor": frete_valor,
+            "custo_mod": custo_mod,
+            "custo_devol": custo_devol,
+            "custo_comis": custo_comis,
+            "custo_bon": custo_bon,
+        }
+
+    @staticmethod
+    def calcular_preco_sugerido_sem_ipi(cpv: float, frete_pct: float, params: Dict[str, float], vpc_pct: float = 0.0) -> float:
+        """
+        Fórmula Oficial (gross-up):
+          custo_mod = CPV * (1 + MOD)
+          total_var% = trib + devol + comissao + bonificacao + frete% + margem + vpc
+          preço s/ IPI = custo_mod / (1 - total_var%)
+        """
+        trib = float(params.get("TRIBUTOS", 0.15))
+        devol = float(params.get("DEVOLUCAO", 0.03))
+        comis = float(params.get("COMISSAO", 0.03))
+        bon = float(params.get("BONIFICACAO", 0.01))
+        margem = float(params.get("MC_ALVO", 0.09))
         mod = float(params.get("MOD", 0.01))
 
-        vpc_cond = float(vpc_pct or 0.0) if aplicar_vpc else 0.0
         custo_mod = float(cpv) * (1.0 + mod)
-
-        total_cv_pct = trib + devol + comis + bon + float(frete_pct) + mc_alvo + vpc_cond
-        denom = 1.0 - total_cv_pct
+        total_var_pct = trib + devol + comis + bon + float(frete_pct) + margem + float(vpc_pct or 0.0)
+        denom = 1.0 - total_var_pct
         if denom <= 0:
-            raise ValueError("Total de custos variáveis % >= 100%. Ajuste parâmetros.")
-
+            raise ValueError("Total custos variáveis >= 100%. Ajuste parâmetros.")
         return custo_mod / denom
 
 
 # ==================== LOOKUPS (performance) ====================
 def build_precos_lookup(df_precos: pd.DataFrame) -> Dict[str, Any]:
     """
-    Saída:
-      - options_desc: lista de descrições (únicas visualmente)
-      - opt_map: option -> {codpro, desc, prod}
-      - clientes_list (se existir)
+    Lista de seleção por descrição (sem código visível),
+    e chave interna CODPRO por item.
     """
-    out: Dict[str, Any] = {"options_desc": [], "opt_map": {}, "clientes_list": []}
+    out: Dict[str, Any] = {"options_desc": [], "opt_map": {}}
     if df_precos is None or df_precos.empty:
         return out
 
     col_codpro = pick_col(df_precos, ["CODPRO"])
     col_prod = pick_col(df_precos, ["PROD"])
     col_desc = pick_col(df_precos, ["DESCRICAO"])
-    col_cli = pick_col(df_precos, ["CLIENTE"])
 
     if not col_prod and not col_desc:
         return out
 
     df = df_precos.copy()
-
     if col_prod:
         df[col_prod] = df[col_prod].apply(normalizar_texto)
     if col_desc:
@@ -534,12 +571,9 @@ def build_precos_lookup(df_precos: pd.DataFrame) -> Dict[str, Any]:
     if col_codpro:
         df[col_codpro] = df[col_codpro].apply(norm_cod)
 
-    # montar descrição "limpa" para tela (sem código)
+    seen_count: Dict[str, int] = {}
     desc_list: List[str] = []
     opt_map: Dict[str, Dict[str, str]] = {}
-
-    # contador para duplicidades (mesma descrição)
-    seen_count: Dict[str, int] = {}
 
     for _, r in df.iterrows():
         prod = normalizar_texto(r[col_prod]) if col_prod else ""
@@ -547,60 +581,41 @@ def build_precos_lookup(df_precos: pd.DataFrame) -> Dict[str, Any]:
 
         codpro = norm_cod(r[col_codpro]) if col_codpro else ""
         if codpro:
-            # se CODPRO veio numérico e PROD tem zeros/sufixos, prioriza código do PROD
+            # se CODPRO vier truncado por Excel, prioriza o prefixo real do PROD quando maior
             cod_prod = cod_from_prod(prod)
             if cod_prod and len(cod_prod) > len(codpro):
                 codpro = cod_prod
         else:
-            # se não há CODPRO, tenta pegar do PROD (último recurso)
             codpro = cod_from_prod(prod)
 
         if not codpro:
             continue
 
-        if desc_raw:
-            desc_limpa = desc_raw
-        else:
-            desc_limpa = descricao_from_prod(prod, codpro)
-
+        desc_limpa = desc_raw if desc_raw else descricao_from_prod(prod, codpro)
         desc_limpa = desc_limpa.strip()
         if not desc_limpa:
             continue
 
-        base_key = desc_limpa.lower()
-        seen_count[base_key] = seen_count.get(base_key, 0) + 1
-        option = option_unico_visual(desc_limpa, seen_count[base_key])
+        k = desc_limpa.lower()
+        seen_count[k] = seen_count.get(k, 0) + 1
+        opt = option_unico_visual(desc_limpa, seen_count[k])
 
-        desc_list.append(option)
-        opt_map[option] = {"codpro": codpro, "desc": desc_limpa, "prod": prod}
+        desc_list.append(opt)
+        opt_map[opt] = {"codpro": codpro, "desc": desc_limpa, "prod": prod}
 
-    # ordenar pelo texto visível (sem invisíveis)
-    desc_list_sorted = sorted(desc_list, key=lambda x: strip_invisiveis(x).lower())
-    out["options_desc"] = desc_list_sorted
+    desc_list = sorted(desc_list, key=lambda x: strip_invisiveis(x).lower())
+    out["options_desc"] = desc_list
     out["opt_map"] = opt_map
-
-    if col_cli:
-        df[col_cli] = df[col_cli].astype(str)
-        out["clientes_list"] = sorted(df[col_cli].dropna().unique().tolist())
-
     return out
 
 
 def build_inv_lookup(df_inv: pd.DataFrame) -> Dict[str, float]:
-    """
-    Inventário:
-      - CODPRO/SKU/Produto (chave)
-      - CUSTO (via DE→PARA)
-    """
     if df_inv is None or df_inv.empty:
         return {}
-
     col_cod = pick_col(df_inv, ["CODPRO"])
     col_custo = pick_col(df_inv, ["CUSTO_INVENTARIO"])
-
     if not col_cod or not col_custo:
         return {}
-
     out: Dict[str, float] = {}
     tmp = df_inv[[col_cod, col_custo]].dropna()
     for _, r in tmp.iterrows():
@@ -614,24 +629,44 @@ def build_inv_lookup(df_inv: pd.DataFrame) -> Dict[str, float]:
     return out
 
 
-def build_frete_lookup(df_frete: pd.DataFrame) -> Dict[str, float]:
+def build_frete_lookup(df_frete: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    Retorna:
+      frete_pct[UF] = % (0-1) se existir
+      frete_val[UF] = valor (R$) se existir
+    """
+    out = {"pct": {}, "val": {}}
     if df_frete is None or df_frete.empty:
-        return {}
+        return out
+
     col_uf = pick_col(df_frete, ["UF"])
     col_pct = pick_col(df_frete, ["FRETE_PCT"])
-    if not col_uf or not col_pct:
-        return {}
-    out = {}
-    tmp = df_frete[[col_uf, col_pct]].dropna()
-    for _, r in tmp.iterrows():
-        uf = str(r[col_uf]).upper()
-        try:
-            v = float(r[col_pct])
-            if v > 1.0:
-                v = v / 100.0
-            out[uf] = max(0.0, min(v, 0.90))
-        except Exception:
-            continue
+    col_val = pick_col(df_frete, ["FRETE_VALOR"])
+
+    if not col_uf:
+        return out
+
+    if col_pct:
+        tmp = df_frete[[col_uf, col_pct]].dropna()
+        for _, r in tmp.iterrows():
+            uf = str(r[col_uf]).upper()
+            try:
+                v = float(r[col_pct])
+                if v > 1.0:
+                    v = v / 100.0
+                out["pct"][uf] = max(0.0, min(v, 0.90))
+            except Exception:
+                continue
+
+    if col_val:
+        tmp = df_frete[[col_uf, col_val]].dropna()
+        for _, r in tmp.iterrows():
+            uf = str(r[col_uf]).upper()
+            try:
+                out["val"][uf] = float(r[col_val])
+            except Exception:
+                continue
+
     return out
 
 
@@ -642,9 +677,14 @@ def inicializar_sessao():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    # persistência da última consulta (usuário não perde contexto ao trocar de tela)
-    persist_defaults = {"last_desc_option": "", "last_modo": "UF destino", "last_uf": "SP", "last_cliente": ""}
-    for k, v in persist_defaults.items():
+    # persistência (não perder última consulta ao mudar de tela)
+    persist = {
+        "last_desc_option": "",
+        "last_uf": "SP",
+        "last_preco_sim": 0.0,
+        "last_sku_sim": "",
+    }
+    for k, v in persist.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -671,7 +711,7 @@ def tela_login(supabase):
                     st.error("❌ E-mail ou senha incorretos")
 
 
-def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, float]):
+def tela_consulta(supabase, links: Dict[str, str], params: Dict[str, float]):
     st.title("🔎 Consulta de Preços + Margens (MC / EBITDA)")
 
     with st.spinner("Carregando bases..."):
@@ -693,8 +733,8 @@ def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, floa
                     st.caption(msg)
 
     if falhas:
-        st.error("⚠️ Não é possível consultar enquanto houver base indisponível: " + ", ".join(falhas))
-        st.info("Ação: vá em Configurações (ADM/Master) e atualize os links.")
+        st.error("⚠️ Revise os links: " + ", ".join(falhas))
+        st.info("Ação: acesse Configurações (ADM/Master) para atualizar os links.")
         return
 
     precos_lk = build_precos_lookup(df_precos)
@@ -711,28 +751,18 @@ def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, floa
     st.divider()
     st.subheader("📌 Parâmetros de consulta")
 
-    col_a, col_b, col_c = st.columns([6, 2, 2])
-
+    col_a, col_b = st.columns([7, 2])
     with col_a:
         last_opt = st.session_state.get("last_desc_option", "")
         options = ["Selecione..."] + options_desc
         idx = options.index(last_opt) if last_opt in options else 0
         desc_opt = st.selectbox("Buscar pela descrição do produto", options=options, index=idx)
         if desc_opt == "Selecione...":
-            st.info("💡 Selecione uma descrição para consultar.")
+            st.info("💡 Selecione um item.")
             return
         st.session_state["last_desc_option"] = desc_opt
 
     with col_b:
-        modo = st.radio(
-            "Base de destino",
-            options=["UF destino", "Cliente"],
-            horizontal=True,
-            index=0 if st.session_state.get("last_modo") == "UF destino" else 1,
-        )
-        st.session_state["last_modo"] = modo
-
-    with col_c:
         uf = st.selectbox(
             "UF destino",
             options=Config.UFS_BRASIL,
@@ -742,62 +772,148 @@ def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, floa
 
     item = opt_map.get(desc_opt)
     if not item:
-        st.error("❌ Falha ao resolver o item selecionado (mapeamento interno).")
+        st.error("❌ Falha interna ao resolver item selecionado.")
         return
 
     codpro = item.get("codpro", "")
     desc_limpa = item.get("desc", strip_invisiveis(desc_opt))
-
     if not codpro:
-        st.error("❌ Não consegui identificar o código interno (CODPRO).")
+        st.error("❌ Não consegui identificar CODPRO para o item.")
         return
 
-    # custo do inventário por CODPRO
     custo = inv_lk.get(codpro)
     if custo is None:
-        st.error("❌ Não achei o Custo (coluna CUSTO/CPV/CMV) na base 'Inventário' para esse item.")
-        st.info("Ação: alinhar o CODPRO do Inventário com o CODPRO da base Preços Atuais.")
+        st.error("❌ Não achei o custo no Inventário (coluna CUSTO) para esse item.")
+        st.info("Ação: alinhar CODPRO do Inventário com CODPRO da base Preços Atuais.")
         if is_admin():
             with st.expander("🧾 Detalhe técnico (ADM/Master)"):
-                st.write(f"CODPRO usado no lookup: **{codpro}**")
+                st.write(f"CODPRO usado: **{codpro}**")
         return
 
-    frete_pct = frete_lk.get(str(uf).upper())
+    # frete: preferir %; se só existir valor, usamos como valor no MC/EBITDA
+    frete_pct = frete_lk["pct"].get(str(uf).upper())
+    frete_val = frete_lk["val"].get(str(uf).upper(), 0.0)
+
     if frete_pct is None:
-        st.error("❌ Não achei Frete% para a UF selecionada na base Frete.")
-        return
+        st.warning("⚠️ Frete% não encontrado. Vou calcular preço sugerido sem considerar % de frete (apenas MC/EBITDA com frete valor, se houver).")
+        frete_pct = 0.0
 
     try:
-        preco_sugerido_sem_ipi = PrecificacaoOficialAMVOX.calcular_preco_sugerido_sem_ipi(
+        preco_sugerido_sem_ipi = MotorPrecificacao.calcular_preco_sugerido_sem_ipi(
             cpv=custo,
             frete_pct=frete_pct,
             params=params,
-            aplicar_vpc=False,
             vpc_pct=0.0,
         )
     except Exception as e:
         st.error(tradutor_erro(e))
         return
 
+    metricas = MotorPrecificacao.calcular_metricas(preco_sugerido_sem_ipi, custo, frete_val, params)
+
     st.divider()
-    st.subheader("📈 Resultado (Preço Sugerido)")
+    st.subheader("📈 Resultado (automático)")
 
-    st.caption(f"Item selecionado: **{desc_limpa}**")
+    st.caption(f"Item: **{desc_limpa}**")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("Custo (Inventário)", formatar_moeda(custo))
-    with c2:
-        st.metric("Frete % (UF)", f"{frete_pct*100:.2f}%")
-    with c3:
         st.metric("Preço Sugerido s/ IPI", formatar_moeda(preco_sugerido_sem_ipi))
+    with c2:
+        st.metric("Margem Contribuição (R$)", formatar_moeda(metricas["mc"]), f"{metricas['perc_mc']:.2f}%")
+    with c3:
+        st.metric("EBITDA (R$)", formatar_moeda(metricas["ebitda"]), f"{metricas['perc_ebitda']:.2f}%")
+    with c4:
+        st.metric("Custo (Inventário)", formatar_moeda(custo))
 
     if is_admin():
         with st.expander("🧾 Detalhe técnico (ADM/Master)"):
-            st.write(f"CODPRO (chave interna): **{codpro}**")
+            st.write(f"CODPRO (chave): **{codpro}**")
+            st.write(f"Frete% (UF): **{frete_pct*100:.2f}%**")
+            st.write(f"Frete valor (UF): **{formatar_moeda(frete_val)}**")
 
 
-def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]):
+def tela_simulador(supabase, links: Dict[str, str], params: Dict[str, float]):
+    st.title("📊 Simulador de Margem EBITDA (manual)")
+
+    with st.spinner("Carregando bases..."):
+        df_inv, ok_i, msg_i = load_excel_base(links.get("Inventário", ""))
+        df_frete, ok_f, msg_f = load_excel_base(links.get("Frete", ""))
+
+    with st.expander("📌 Status das Bases", expanded=not (ok_i and ok_f)):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.success("✅ Inventário") if ok_i else st.error("❌ Inventário")
+            if not ok_i:
+                st.caption(msg_i)
+        with col2:
+            st.success("✅ Frete") if ok_f else st.error("❌ Frete")
+            if not ok_f:
+                st.caption(msg_f)
+
+    if not ok_i or not ok_f:
+        st.error("⚠️ Para usar o Simulador, Inventário e Frete precisam estar OK.")
+        return
+
+    inv_lk = build_inv_lookup(df_inv)
+    frete_lk = build_frete_lookup(df_frete)
+
+    st.divider()
+    st.subheader("📌 Inputs")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        codpro = st.text_input("CODPRO (SKU interno)", value=st.session_state.get("last_sku_sim", ""))
+        codpro = norm_cod(codpro)
+        st.session_state["last_sku_sim"] = codpro
+
+        custo = inv_lk.get(codpro, 0.0)
+        st.number_input("Custo (Inventário) — automático", value=float(custo), disabled=True, format="%.2f")
+
+    with col_b:
+        uf = st.selectbox(
+            "UF destino",
+            options=Config.UFS_BRASIL,
+            index=Config.UFS_BRASIL.index(st.session_state.get("last_uf", "SP")) if st.session_state.get("last_uf", "SP") in Config.UFS_BRASIL else 0,
+        )
+        st.session_state["last_uf"] = uf
+
+        preco = st.number_input("Preço s/ IPI (R$)", min_value=0.0, step=10.0, format="%.2f", value=float(st.session_state.get("last_preco_sim", 0.0)))
+        st.session_state["last_preco_sim"] = float(preco)
+
+    if not codpro:
+        st.info("💡 Informe o CODPRO para buscar custo no Inventário.")
+        return
+    if custo <= 0:
+        st.warning("⚠️ Custo não encontrado no Inventário para esse CODPRO.")
+        return
+    if preco <= 0:
+        st.info("💡 Informe o preço para calcular MC/EBITDA.")
+        return
+
+    frete_val = frete_lk["val"].get(str(uf).upper(), 0.0)
+
+    metricas = MotorPrecificacao.calcular_metricas(preco, float(custo), float(frete_val), params)
+
+    st.divider()
+    st.subheader("📈 Resultado")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Receita Líquida", formatar_moeda(metricas["receita_liquida"]))
+    with c2:
+        st.metric("MC", formatar_moeda(metricas["mc"]), f"{metricas['perc_mc']:.2f}%")
+    with c3:
+        st.metric("EBITDA", formatar_moeda(metricas["ebitda"]), f"{metricas['perc_ebitda']:.2f}%")
+    with c4:
+        st.metric("Custo Variável", formatar_moeda(metricas["custo_variavel_total"]))
+
+    with st.expander("📋 Detalhamento"):
+        st.write(f"Frete valor ({uf}): {formatar_moeda(frete_val)}")
+        st.write(f"Custo c/ MOD: {formatar_moeda(metricas['custo_mod'])}")
+
+
+def tela_configuracoes(supabase, links: Dict[str, str]):
     st.title("⚙️ Configurações (ADM/Master)")
     if not is_admin():
         st.warning("⚠️ Acesso restrito a ADM/Master")
@@ -810,12 +926,14 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
         url_salva = links.get(base, "")
         with st.expander(f"📌 {base}", expanded=True):
             novo_link = st.text_area("Link da planilha", value=url_salva, height=90, key=f"link_{base}")
+
             if novo_link and novo_link.strip():
                 df_teste, ok, msg = testar_link_tempo_real(novo_link.strip())
                 if ok:
                     st.success("✅ Link válido: " + msg)
                     st.caption("Colunas detectadas:")
                     st.code(", ".join(df_teste.columns.tolist()))
+
                     if st.button("💾 Salvar", key=f"save_{base}", use_container_width=True):
                         ok_save, msg_save = salvar_link_config(supabase, base, novo_link.strip())
                         if ok_save:
@@ -854,7 +972,8 @@ def main():
         st.caption("🎭 " + str(st.session_state.get("perfil")))
         st.divider()
 
-        opcoes = ["🔎 Consulta", "⚙️ Configurações", "ℹ️ Sobre"] if is_admin() else ["🔎 Consulta", "ℹ️ Sobre"]
+        # Baseline restaurado
+        opcoes = ["🔎 Consulta", "📊 Simulador", "⚙️ Configurações", "ℹ️ Sobre"] if is_admin() else ["🔎 Consulta", "📊 Simulador", "ℹ️ Sobre"]
         menu = st.radio("Menu", opcoes, label_visibility="collapsed")
 
         st.divider()
@@ -867,9 +986,11 @@ def main():
         st.caption(f"v{__version__} | {__release_date__}")
 
     if menu == "🔎 Consulta":
-        tela_consulta_precos(supabase, links, params)
+        tela_consulta(supabase, links, params)
+    elif menu == "📊 Simulador":
+        tela_simulador(supabase, links, params)
     elif menu == "⚙️ Configurações":
-        tela_configuracoes(supabase, links, params)
+        tela_configuracoes(supabase, links)
     else:
         tela_sobre()
 
