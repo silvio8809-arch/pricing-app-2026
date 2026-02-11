@@ -19,12 +19,14 @@ import requests
 
 # ==================== VERSÃO (LEAN) ====================
 APP_NAME = "Pricing 2026"
-__version__ = "3.5.4"
+__version__ = "3.6.0"
 __release_date__ = "2026-02-10"
 __last_changes__ = [
-    "Descrição passou a priorizar coluna PROD (SKU + descrição concatenados) na base Preços Atuais",
-    "Mantida consulta por SKU ou por Descrição via lista 'SKU - PROD'",
-    "Correções de robustez para campos vazios (não quebra com NaN/None)",
+    "Consulta agora CALCULA automaticamente o Preço Sugerido (Sem IPI) pela fórmula oficial (gross-up)",
+    "Consulta exibe: Preço Sugerido + MC + EBITDA (Preço Atual vira apenas referência)",
+    "Parâmetros do gross-up editáveis por ADM/Master (inclui Frete% por UF e IPI opcional)",
+    "Correção Streamlit: removido cache em funções com objeto Supabase (evita UnhashableParamError)",
+    "Descrição prioriza PROD (SKU + descrição concatenados) quando existir",
 ]
 
 # ==================== CONFIGURAÇÃO INICIAL ====================
@@ -50,14 +52,16 @@ class Config:
         "AP", "TO", "PI", "RN", "PB", "AL", "SE",
     ]
 
+    # Defaults alinhados com sua política (podem ser alterados pela tela Configurações)
     DEFAULT_PARAMS = {
-        "TRIBUTOS": 0.15,
-        "DEVOLUCAO": 0.03,
-        "COMISSAO": 0.03,
-        "BONIFICACAO_CUSTO": 0.01,
-        "MC_ALVO": 0.16,
-        "MOD_CUSTO": 0.01,
-        "OVERHEAD": 0.16,
+        "TRIBUTOS": 0.15,        # base receita
+        "DEVOLUCAO": 0.03,       # base receita
+        "COMISSAO": 0.03,        # base receita
+        "BONIFICACAO": 0.01,     # base receita (somatório do gross-up)
+        "MC_ALVO": 0.09,         # margem alvo (gross-up)
+        "MOD": 0.01,             # base custo (CPV)
+        "OVERHEAD": 0.16,        # fora do preço (impacta EBITDA)
+        "IPI": 0.00,             # opcional (se precisar exibir preço com IPI)
     }
 
 
@@ -106,13 +110,14 @@ def normalizar_texto(s: object) -> str:
 # ==================== DE→PARA (Governança de Dados) ====================
 DEPARA_COLUNAS: Dict[str, List[str]] = {
     "SKU": ["SKU", "Produto", "CODPRO", "CodPro", "Código do Produto", "Codigo do Produto", "Codigo", "Código", "COD", "Cód"],
-    # PROD entra como prioridade de descrição (coluna pronta: SKU + descrição concatenados)
+    # PROD é prioridade de descrição (base Preços Atuais costuma trazer SKU+descrição concatenados)
     "DESCRICAO": ["PROD", "Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto",
                   "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto", "Produto Descrição"],
     "PRECO": ["Preço", "Preco", "Preço Atual", "Preco Atual", "Preço Venda", "Preco Venda", "PV", "Preço Sem IPI", "Preco Sem IPI"],
     "CUSTO_INVENTARIO": ["Custo Inventário", "Custo Inventario", "Custo", "CMV", "CPV", "Custo Produto", "Custo Mercadoria"],
     "UF": ["UF", "Estado", "Destino", "UF Destino"],
-    "FRETE_VALOR": ["Valor", "Frete", "Custo Frete", "Custo do Frete", "Valor Frete", "Custo"],
+    # IMPORTANTE: Frete agora é tratado como PERCENTUAL no gross-up (frete% por UF)
+    "FRETE_PCT": ["Frete%", "Frete %", "Percentual Frete", "Perc Frete", "Frete Perc", "FRETE_PCT", "FRETE %"],
     "CLIENTE": ["Cliente", "Nome", "Nome do Cliente", "Razão Social", "Razao Social", "Cliente Nome", "CNPJ"],
     "VPC": ["VPC", "VPC%", "VPC %", "Percentual", "Perc", "Desconto", "Desconto%", "VPC Perc", "VPC Percentual"],
 }
@@ -123,6 +128,7 @@ EXTRAS_SINONIMOS = {
     "CUSTO_INVENTARIO": ["CUSTO_INV", "CUSTO INV", "CUSTO MEDIO", "CUSTO MÉDIO"],
     "CLIENTE": ["NOMECLIENTE", "NOME CLIENTE"],
     "DESCRICAO": ["PRODUTO", "PROD DESC", "PROD_DESCRICAO", "PROD DESCRICAO", "PROD DESCR"],
+    "FRETE_PCT": ["FRETE PCT", "FRETE_PERCENTUAL", "PERC_FRETE", "PERCENTUAL_FRETE"],
 }
 
 
@@ -249,20 +255,20 @@ def salvar_parametro(supabase, nome: str, valor_percentual: float, grupo: str = 
         return False, tradutor_erro(e)
 
 
-@st.cache_data(ttl=Config.CACHE_TTL)
-def carregar_links(_supabase) -> Dict[str, str]:
+# ✅ Sem cache aqui (evita erro unhashable com objeto Supabase)
+def carregar_links(supabase) -> Dict[str, str]:
     try:
-        response = _supabase.table("config_links").select("*").execute()
+        response = supabase.table("config_links").select("*").execute()
         return {item["base_nome"]: item["url_link"] for item in response.data}
     except Exception:
         return {}
 
 
-@st.cache_data(ttl=Config.CACHE_TTL)
-def carregar_parametros(_supabase) -> Dict[str, float]:
+# ✅ Sem cache aqui (evita erro unhashable com objeto Supabase)
+def carregar_parametros(supabase) -> Dict[str, float]:
     params = dict(Config.DEFAULT_PARAMS)
     try:
-        resp = _supabase.table("config_parametros").select("*").execute()
+        resp = supabase.table("config_parametros").select("*").execute()
         if resp.data:
             for row in resp.data:
                 nome = str(row.get("nome_parametro", "")).strip().upper()
@@ -428,72 +434,122 @@ def autenticar_usuario(supabase, email: str, senha: str) -> Tuple[bool, Optional
         return False, None
 
 
-# ==================== MOTOR DE CÁLCULO (AMVOX) ====================
-class CalculadoraAMVOX:
-    @staticmethod
-    def calcular(
-        preco_bruto: float,
-        custo_inventario: float,
-        frete_uf: float,
-        params: Dict[str, float],
-        aplicar_vpc: bool = False,
-        vpc_pct: float = 0.0,
-    ) -> Dict[str, float]:
-        preco_bruto = float(preco_bruto or 0)
-        custo_inventario = float(custo_inventario or 0)
-        frete_uf = float(frete_uf or 0)
+# ==================== MOTOR (FÓRMULA OFICIAL AMVOX) ====================
+class PrecificacaoOficialAMVOX:
+    """
+    Fórmula Oficial (Sem IPI):
+      Custo Mercadoria c/ MOD = CPV * (1 + MOD)
+      Total Custos Variáveis% = Tributos + Devoluções + Comissão + Bonificação + FreteUF% + Margem + VPC_condicional
+      Preço Sem IPI = (Custo Mercadoria c/ MOD) / (1 - Total Custos Variáveis%)
+    Observação:
+      - Overhead NÃO entra no preço (impacta EBITDA)
+      - VPC é condicional (só entra se aplicar)
+    """
 
+    @staticmethod
+    def calcular_preco_sugerido_sem_ipi(
+        cpv: float,
+        frete_pct: float,
+        params: Dict[str, float],
+        aplicar_vpc: bool,
+        vpc_pct: float,
+    ) -> Tuple[float, Dict[str, float]]:
         trib = float(params.get("TRIBUTOS", 0.15))
         devol = float(params.get("DEVOLUCAO", 0.03))
         comis = float(params.get("COMISSAO", 0.03))
-        bon_custo = float(params.get("BONIFICACAO_CUSTO", 0.01))
-        mod_custo = float(params.get("MOD_CUSTO", 0.01))
+        bon = float(params.get("BONIFICACAO", 0.01))
+        mc_alvo = float(params.get("MC_ALVO", 0.09))
+        mod = float(params.get("MOD", 0.01))
+
+        vpc_cond = float(vpc_pct or 0.0) if aplicar_vpc else 0.0
+
+        custo_mod = float(cpv) * (1.0 + mod)
+
+        total_cv_pct = trib + devol + comis + bon + float(frete_pct) + mc_alvo + vpc_cond
+        denom = 1.0 - total_cv_pct
+
+        if denom <= 0:
+            raise ValueError(
+                "Total de custos variáveis % >= 100%. Ajuste parâmetros (Tributos/Devolução/Comissão/Bonificação/Frete%/MC/VPC)."
+            )
+
+        preco_sem_ipi = custo_mod / denom
+
+        detalhes = {
+            "cpv": float(cpv),
+            "mod": mod,
+            "custo_mod": custo_mod,
+            "tributos": trib,
+            "devolucao": devol,
+            "comissao": comis,
+            "bonificacao": bon,
+            "frete_pct": float(frete_pct),
+            "mc_alvo": mc_alvo,
+            "vpc_cond": vpc_cond,
+            "total_cv_pct": total_cv_pct,
+            "denom": denom,
+        }
+        return preco_sem_ipi, detalhes
+
+    @staticmethod
+    def calcular_mc_ebitda(
+        preco_sem_ipi: float,
+        cpv: float,
+        frete_pct: float,
+        params: Dict[str, float],
+        aplicar_vpc: bool,
+        vpc_pct: float,
+    ) -> Dict[str, float]:
+        trib = float(params.get("TRIBUTOS", 0.15))
+        devol = float(params.get("DEVOLUCAO", 0.03))
+        comis = float(params.get("COMISSAO", 0.03))
+        bon = float(params.get("BONIFICACAO", 0.01))
         overhead = float(params.get("OVERHEAD", 0.16))
+        mod = float(params.get("MOD", 0.01))
 
-        vpc_pct = float(vpc_pct or 0)
-        vpc_aplicado = vpc_pct if aplicar_vpc else 0.0
+        vpc_cond = float(vpc_pct or 0.0) if aplicar_vpc else 0.0
 
-        receita_base = preco_bruto * (1 - vpc_aplicado)
-        receita_liquida = receita_base * (1 - trib)
+        # Base de receita após VPC (decisão comercial)
+        receita_base = float(preco_sem_ipi) * (1.0 - vpc_cond)
 
-        custo_mod = custo_inventario * mod_custo
-        custo_bon = custo_inventario * bon_custo
+        # Receita líquida (menos tributos)
+        receita_liquida = receita_base * (1.0 - trib)
+
+        # Custos variáveis em valor (base receita)
         custo_devol = receita_base * devol
         custo_comis = receita_base * comis
+        custo_bon = receita_base * bon
+        custo_frete = receita_base * float(frete_pct)
 
-        custos_variaveis = (
-            custo_inventario
-            + custo_mod
-            + custo_bon
-            + frete_uf
-            + custo_devol
-            + custo_comis
-        )
+        # Custo mercadoria c/ MOD (base custo)
+        custo_mod = float(cpv) * (1.0 + mod)
 
-        mc_val = receita_liquida - custos_variaveis
+        # Margem de Contribuição (líquida - variáveis)
+        custos_variaveis_val = custo_mod + custo_devol + custo_comis + custo_bon + custo_frete
+        mc_val = receita_liquida - custos_variaveis_val
         mc_pct = (mc_val / receita_base) if receita_base > 0 else 0.0
 
+        # EBITDA = MC - custos fixos (overhead)
         overhead_val = receita_base * overhead
         ebitda_val = mc_val - overhead_val
         ebitda_pct = (ebitda_val / receita_base) if receita_base > 0 else 0.0
 
         return {
-            "preco_bruto": preco_bruto,
-            "vpc_pct": vpc_aplicado,
+            "preco_sem_ipi": float(preco_sem_ipi),
             "receita_base": receita_base,
             "receita_liquida": receita_liquida,
-            "custo_inventario": custo_inventario,
-            "frete_uf": frete_uf,
             "custo_mod": custo_mod,
-            "custo_bonificacao": custo_bon,
-            "custo_devolucao": custo_devol,
-            "custo_comissao": custo_comis,
-            "custos_variaveis": custos_variaveis,
+            "custo_devol": custo_devol,
+            "custo_comis": custo_comis,
+            "custo_bon": custo_bon,
+            "custo_frete": custo_frete,
+            "custos_variaveis_val": custos_variaveis_val,
             "mc_val": mc_val,
             "mc_pct": mc_pct,
             "overhead_val": overhead_val,
             "ebitda_val": ebitda_val,
             "ebitda_pct": ebitda_pct,
+            "vpc_pct": vpc_cond,
         }
 
 
@@ -514,7 +570,7 @@ def get_price_from_df_precos(df_precos: pd.DataFrame, sku: str) -> Optional[floa
 
 def get_desc_from_df_precos(df_precos: pd.DataFrame, sku: str) -> str:
     col_sku = pick_col(df_precos, ["SKU"])
-    col_desc = pick_col(df_precos, ["DESCRICAO"])  # agora prioriza PROD
+    col_desc = pick_col(df_precos, ["DESCRICAO"])  # prioriza PROD
     if not col_sku or not col_desc:
         return ""
     linha = df_precos[df_precos[col_sku].astype(str) == str(sku)]
@@ -523,7 +579,7 @@ def get_desc_from_df_precos(df_precos: pd.DataFrame, sku: str) -> str:
     return normalizar_texto(linha[col_desc].values[0])
 
 
-def get_custo_inventario(df_inv: pd.DataFrame, sku: str) -> Optional[float]:
+def get_cpv(df_inv: pd.DataFrame, sku: str) -> Optional[float]:
     col_sku = pick_col(df_inv, ["SKU"])
     col_custo = pick_col(df_inv, ["CUSTO_INVENTARIO"])
     if not col_sku or not col_custo:
@@ -537,18 +593,28 @@ def get_custo_inventario(df_inv: pd.DataFrame, sku: str) -> Optional[float]:
         return None
 
 
-def get_frete_uf(df_frete: pd.DataFrame, uf: str) -> float:
+def get_frete_pct_uf(df_frete: pd.DataFrame, uf: str) -> Optional[float]:
+    """
+    Frete deve ser percentual por UF (ex.: 0.045 = 4,5%).
+    Se vier como 4.5 (em %), convertemos para 0.045.
+    """
     col_uf = pick_col(df_frete, ["UF"])
-    col_val = pick_col(df_frete, ["FRETE_VALOR"])
-    if not col_uf or not col_val:
-        return 0.0
+    col_pct = pick_col(df_frete, ["FRETE_PCT"])
+    if not col_uf or not col_pct:
+        return None
+
     linha = df_frete[df_frete[col_uf].astype(str).str.upper() == str(uf).upper()]
     if linha.empty:
-        return 0.0
+        return None
+
     try:
-        return float(linha[col_val].values[0])
+        v = float(linha[col_pct].values[0])
+        # se vier em "percentual cheio" (ex.: 4.5), converte
+        if v > 1.0:
+            v = v / 100.0
+        return max(0.0, min(v, 0.90))
     except Exception:
-        return 0.0
+        return None
 
 
 def get_vpc_cliente(df_vpc: pd.DataFrame, cliente: str, sku: Optional[str] = None) -> float:
@@ -707,56 +773,98 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
             uf = st.selectbox("UF destino (fallback)", options=Config.UFS_BRASIL)
 
     desc = get_desc_from_df_precos(df_precos, sku)
-    st.caption("SKU selecionado: **" + sku + "** | PROD (descrição): **" + (desc if desc else "(sem descrição)") + "**")
+    st.caption("SKU: **" + sku + "** | PROD: **" + (desc if desc else "(sem descrição)") + "**")
 
-    preco_atual = get_price_from_df_precos(df_precos, sku)
-    custo_inv = get_custo_inventario(df_inv, sku)
-
-    if preco_atual is None:
-        st.error("❌ Não achei a coluna de preço na base 'Preços Atuais' (Preço/Preço Atual/PV...).")
-        return
-    if custo_inv is None:
-        st.error("❌ Não achei a coluna de custo na base 'Inventário' (Custo Inventário/CMV/CPV...).")
+    # Dados-base para o cálculo oficial
+    cpv = get_cpv(df_inv, sku)
+    if cpv is None:
+        st.error("❌ Não achei o CPV/CPV na base 'Inventário' (Custo Inventário/CMV/CPV...).")
         return
 
-    frete_uf = get_frete_uf(df_frete, uf or "")
+    frete_pct = get_frete_pct_uf(df_frete, uf)
+    if frete_pct is None:
+        st.error(
+            "❌ Frete UF precisa estar em percentual por UF.\n\n"
+            "Ação: na base Frete, garanta as colunas UF e Frete% (ex.: 0,045 para 4,5% ou 4,5)."
+        )
+        return
+
+    # VPC condicional
     vpc_pct = 0.0
     aplicar_vpc = False
-
     if modo == "Cliente" and cliente and cliente != "Selecione...":
         vpc_pct = get_vpc_cliente(df_vpc, cliente, sku=sku)
         aplicar_vpc = st.toggle("Aplicar VPC", value=(vpc_pct > 0))
-        st.caption("VPC previsto para o cliente: " + (formatar_pct(vpc_pct) if vpc_pct > 0 else "0,00%"))
+        st.caption("VPC previsto: " + (formatar_pct(vpc_pct) if vpc_pct > 0 else "0,00%"))
 
-    res = CalculadoraAMVOX.calcular(
-        preco_bruto=preco_atual,
-        custo_inventario=custo_inv,
-        frete_uf=frete_uf,
+    # Preço atual (referência)
+    preco_atual = get_price_from_df_precos(df_precos, sku)
+
+    # Cálculo oficial do preço sugerido
+    try:
+        preco_sugerido_sem_ipi, detalhes_grossup = PrecificacaoOficialAMVOX.calcular_preco_sugerido_sem_ipi(
+            cpv=cpv,
+            frete_pct=frete_pct,
+            params=params,
+            aplicar_vpc=aplicar_vpc,
+            vpc_pct=vpc_pct,
+        )
+    except Exception as e:
+        st.error("❌ Não foi possível calcular o Preço Sugerido: " + tradutor_erro(e))
+        return
+
+    # MC e EBITDA no preço sugerido
+    res = PrecificacaoOficialAMVOX.calcular_mc_ebitda(
+        preco_sem_ipi=preco_sugerido_sem_ipi,
+        cpv=cpv,
+        frete_pct=frete_pct,
         params=params,
         aplicar_vpc=aplicar_vpc,
         vpc_pct=vpc_pct,
     )
 
+    # Preço com IPI (opcional)
+    ipi = float(params.get("IPI", 0.0))
+    preco_com_ipi = float(preco_sugerido_sem_ipi) * (1.0 + ipi)
+
     st.divider()
-    st.subheader("📊 Resultado (Preço + Margens)")
+    st.subheader("📊 Resultado (Cálculo Automático)")
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("Preço (Base Preços)", formatar_moeda(res["preco_bruto"]))
-        st.caption("PROD: " + (desc if desc else "(sem descrição)"))
+        st.metric("Preço Sugerido (Sem IPI)", formatar_moeda(res["preco_sem_ipi"]))
+        st.caption("Preço com IPI (opcional): " + formatar_moeda(preco_com_ipi))
     with m2:
-        st.metric("Receita Base (pós VPC)", formatar_moeda(res["receita_base"]))
+        st.metric("MC", formatar_moeda(res["mc_val"]), formatar_pct(res["mc_pct"]))
     with m3:
-        st.metric("Margem de Contribuição", formatar_moeda(res["mc_val"]), formatar_pct(res["mc_pct"]))
-    with m4:
         st.metric("EBITDA", formatar_moeda(res["ebitda_val"]), formatar_pct(res["ebitda_pct"]))
+    with m4:
+        if preco_atual is None:
+            st.metric("Preço Atual (ref.)", "N/D")
+        else:
+            st.metric("Preço Atual (ref.)", formatar_moeda(preco_atual))
 
-    mc_alvo = float(params.get("MC_ALVO", 0.16))
     st.divider()
+    mc_alvo = float(params.get("MC_ALVO", 0.09))
     if res["mc_pct"] < mc_alvo:
         st.warning("⚠️ MC abaixo do alvo: " + formatar_pct(res["mc_pct"]) + " < " + formatar_pct(mc_alvo))
     else:
         st.success("✅ MC dentro do alvo: " + formatar_pct(res["mc_pct"]) + " ≥ " + formatar_pct(mc_alvo))
+
+    with st.expander("🧾 Detalhamento do Gross-up (auditoria)"):
+        st.write("**Custo Mercadoria c/ MOD:** " + formatar_moeda(detalhes_grossup["custo_mod"]))
+        st.write("**Frete UF (%):** " + formatar_pct(detalhes_grossup["frete_pct"]))
+        st.write("**Total Custos Variáveis (%):** " + formatar_pct(detalhes_grossup["total_cv_pct"]))
+        st.write("**Denominador (1 - Total CV%):** " + "{0:.4f}".format(detalhes_grossup["denom"]))
+        st.divider()
+        st.write("Componentes do Total CV%:")
+        st.write("- Tributos: " + formatar_pct(detalhes_grossup["tributos"]))
+        st.write("- Devolução: " + formatar_pct(detalhes_grossup["devolucao"]))
+        st.write("- Comissão: " + formatar_pct(detalhes_grossup["comissao"]))
+        st.write("- Bonificação: " + formatar_pct(detalhes_grossup["bonificacao"]))
+        st.write("- Frete UF: " + formatar_pct(detalhes_grossup["frete_pct"]))
+        st.write("- Margem (MC alvo): " + formatar_pct(detalhes_grossup["mc_alvo"]))
+        st.write("- VPC (condicional): " + formatar_pct(detalhes_grossup["vpc_cond"]))
 
 
 def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]):
@@ -765,7 +873,7 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
         st.warning("⚠️ Acesso restrito a usuários ADM/Master")
         return
 
-    tab1, tab2, tab3 = st.tabs(["🔗 Links das Bases", "🧩 Parâmetros de Precificação", "🧠 DE→PARA (Colunas)"])
+    tab1, tab2, tab3 = st.tabs(["🔗 Links das Bases", "🧩 Parâmetros (Gross-up)", "🧠 DE→PARA (Colunas)"])
 
     with tab1:
         st.info("Cole links do OneDrive/SharePoint ou Google Drive/Sheets. Arquivos devem estar públicos via link (Leitor).")
@@ -811,18 +919,22 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
                     st.warning("⚠️ Nenhum link configurado para esta base")
 
     with tab2:
-        st.info("Parâmetros que intervêm no preço. Preenchimento manual, governado por ADM/Master.")
+        st.info("Parâmetros usados no cálculo oficial do preço (gross-up). Governança: ADM/Master.")
         col1, col2, col3 = st.columns(3)
+
         with col1:
             trib = st.number_input("Tributos sobre vendas (%)", 0.0, 100.0, float(params.get("TRIBUTOS", 0.15) * 100), 0.1)
-            devol = st.number_input("Devoluções históricas (%)", 0.0, 100.0, float(params.get("DEVOLUCAO", 0.03) * 100), 0.1)
-            comis = st.number_input("Comissão de vendas (%)", 0.0, 100.0, float(params.get("COMISSAO", 0.03) * 100), 0.1)
+            devol = st.number_input("Devoluções (%)", 0.0, 100.0, float(params.get("DEVOLUCAO", 0.03) * 100), 0.1)
+            comis = st.number_input("Comissão (%)", 0.0, 100.0, float(params.get("COMISSAO", 0.03) * 100), 0.1)
+
         with col2:
-            bon = st.number_input("Bonificações (% sobre custo)", 0.0, 100.0, float(params.get("BONIFICACAO_CUSTO", 0.01) * 100), 0.1)
-            mod = st.number_input("MOD (% sobre custo)", 0.0, 100.0, float(params.get("MOD_CUSTO", 0.01) * 100), 0.1)
-            overhead = st.number_input("Overhead corporativo (%)", 0.0, 100.0, float(params.get("OVERHEAD", 0.16) * 100), 0.1)
+            bon = st.number_input("Bonificação (%)", 0.0, 100.0, float(params.get("BONIFICACAO", 0.01) * 100), 0.1)
+            mc_alvo = st.number_input("Margem (MC alvo) (%)", 0.0, 100.0, float(params.get("MC_ALVO", 0.09) * 100), 0.1)
+            mod = st.number_input("MOD (% do CPV)", 0.0, 100.0, float(params.get("MOD", 0.01) * 100), 0.1)
+
         with col3:
-            mc_alvo = st.number_input("Margem de Contribuição alvo (%)", 0.0, 100.0, float(params.get("MC_ALVO", 0.16) * 100), 0.1)
+            overhead = st.number_input("Overhead corporativo (%) (fora do preço)", 0.0, 100.0, float(params.get("OVERHEAD", 0.16) * 100), 0.1)
+            ipi = st.number_input("IPI (%) (opcional para exibir preço com IPI)", 0.0, 100.0, float(params.get("IPI", 0.0) * 100), 0.1)
 
         st.divider()
         if st.button("💾 Salvar Parâmetros", type="primary", use_container_width=True):
@@ -830,11 +942,13 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
                 "TRIBUTOS": trib / 100.0,
                 "DEVOLUCAO": devol / 100.0,
                 "COMISSAO": comis / 100.0,
-                "BONIFICACAO_CUSTO": bon / 100.0,
-                "MOD_CUSTO": mod / 100.0,
-                "OVERHEAD": overhead / 100.0,
+                "BONIFICACAO": bon / 100.0,
                 "MC_ALVO": mc_alvo / 100.0,
+                "MOD": mod / 100.0,
+                "OVERHEAD": overhead / 100.0,
+                "IPI": ipi / 100.0,
             }
+
             falhas = []
             for nome, val in itens.items():
                 ok, msg = salvar_parametro(supabase, nome, val, grupo="PRECIFICACAO")
@@ -847,7 +961,6 @@ def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]
                 st.info("💡 Ação: confirme se existe a tabela config_parametros com colunas (nome_parametro, valor_percentual, grupo).")
             else:
                 st.success("✅ Parâmetros salvos com sucesso!")
-                st.cache_data.clear()
                 st.rerun()
 
     with tab3:
