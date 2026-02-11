@@ -19,12 +19,12 @@ import requests
 
 # ==================== VERSÃO (LEAN) ====================
 APP_NAME = "Pricing 2026"
-__version__ = "3.5.3"
+__version__ = "3.5.4"
 __release_date__ = "2026-02-10"
 __last_changes__ = [
-    "Correção NameError: adicionada função normalizar_texto()",
-    "Consulta agora permite buscar por SKU OU por Descrição (lista SKU - Descrição)",
-    "Tela exibe a Descrição do SKU selecionado (sem quebrar caso esteja vazia)",
+    "Descrição passou a priorizar coluna PROD (SKU + descrição concatenados) na base Preços Atuais",
+    "Mantida consulta por SKU ou por Descrição via lista 'SKU - PROD'",
+    "Correções de robustez para campos vazios (não quebra com NaN/None)",
 ]
 
 # ==================== CONFIGURAÇÃO INICIAL ====================
@@ -91,7 +91,6 @@ def formatar_pct(frac: float) -> str:
 
 
 def normalizar_texto(s: object) -> str:
-    """Evita quebra quando o campo vem NaN/None/numérico e padroniza texto."""
     try:
         if s is None:
             return ""
@@ -107,7 +106,9 @@ def normalizar_texto(s: object) -> str:
 # ==================== DE→PARA (Governança de Dados) ====================
 DEPARA_COLUNAS: Dict[str, List[str]] = {
     "SKU": ["SKU", "Produto", "CODPRO", "CodPro", "Código do Produto", "Codigo do Produto", "Codigo", "Código", "COD", "Cód"],
-    "DESCRICAO": ["Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto", "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto", "Produto Descrição"],
+    # PROD entra como prioridade de descrição (coluna pronta: SKU + descrição concatenados)
+    "DESCRICAO": ["PROD", "Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto",
+                  "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto", "Produto Descrição"],
     "PRECO": ["Preço", "Preco", "Preço Atual", "Preco Atual", "Preço Venda", "Preco Venda", "PV", "Preço Sem IPI", "Preco Sem IPI"],
     "CUSTO_INVENTARIO": ["Custo Inventário", "Custo Inventario", "Custo", "CMV", "CPV", "Custo Produto", "Custo Mercadoria"],
     "UF": ["UF", "Estado", "Destino", "UF Destino"],
@@ -121,6 +122,7 @@ EXTRAS_SINONIMOS = {
     "PRECO": ["PRECO_VENDA", "PRECO VENDA", "PRECO ATUAL", "PV SEM IPI"],
     "CUSTO_INVENTARIO": ["CUSTO_INV", "CUSTO INV", "CUSTO MEDIO", "CUSTO MÉDIO"],
     "CLIENTE": ["NOMECLIENTE", "NOME CLIENTE"],
+    "DESCRICAO": ["PRODUTO", "PROD DESC", "PROD_DESCRICAO", "PROD DESCRICAO", "PROD DESCR"],
 }
 
 
@@ -512,7 +514,7 @@ def get_price_from_df_precos(df_precos: pd.DataFrame, sku: str) -> Optional[floa
 
 def get_desc_from_df_precos(df_precos: pd.DataFrame, sku: str) -> str:
     col_sku = pick_col(df_precos, ["SKU"])
-    col_desc = pick_col(df_precos, ["DESCRICAO"])
+    col_desc = pick_col(df_precos, ["DESCRICAO"])  # agora prioriza PROD
     if not col_sku or not col_desc:
         return ""
     linha = df_precos[df_precos[col_sku].astype(str) == str(sku)]
@@ -582,14 +584,8 @@ def listar_clientes(df_vpc: pd.DataFrame) -> List[str]:
 
 
 def construir_lista_sku_descricao(df_precos: pd.DataFrame) -> Tuple[List[str], Dict[str, str]]:
-    """
-    Retorna:
-      - lista de opções: ["SKU - Descrição", ...]
-      - mapa: "SKU - Descrição" -> SKU
-    """
     col_sku = pick_col(df_precos, ["SKU"])
-    col_desc = pick_col(df_precos, ["DESCRICAO"])
-
+    col_desc = pick_col(df_precos, ["DESCRICAO"])  # prioriza PROD
     if not col_sku:
         return [], {}
 
@@ -681,7 +677,6 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
             st.info("💡 Vá em **⚙️ Configurações** para corrigir links e/ou parâmetros.")
         return
 
-    # === NOVO: lista SKU - Descrição para permitir consulta por ambos ===
     opcoes, mapa_label_para_sku = construir_lista_sku_descricao(df_precos)
     if not opcoes:
         st.error("❌ Base 'Preços Atuais' sem coluna SKU/Produto/CODPRO (ou equivalente).")
@@ -693,9 +688,9 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
     col_a, col_b, col_c = st.columns([3, 2, 2])
 
     with col_a:
-        selecao = st.selectbox("Buscar por SKU ou Descrição", options=["Selecione..."] + opcoes)
+        selecao = st.selectbox("Buscar por SKU ou Descrição (PROD)", options=["Selecione..."] + opcoes)
         if selecao == "Selecione...":
-            st.info("💡 Selecione um item (SKU - Descrição) para consultar.")
+            st.info("💡 Selecione um item para consultar.")
             return
         sku = mapa_label_para_sku.get(selecao, "")
 
@@ -711,9 +706,8 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
             cliente = st.selectbox("Cliente / Nome", options=["Selecione..."] + clientes) if clientes else "Selecione..."
             uf = st.selectbox("UF destino (fallback)", options=Config.UFS_BRASIL)
 
-    # === Mostra a descrição (SLA de usabilidade) ===
     desc = get_desc_from_df_precos(df_precos, sku)
-    st.caption("SKU selecionado: **" + sku + "** | Descrição: **" + (desc if desc else "(sem descrição)") + "**")
+    st.caption("SKU selecionado: **" + sku + "** | PROD (descrição): **" + (desc if desc else "(sem descrição)") + "**")
 
     preco_atual = get_price_from_df_precos(df_precos, sku)
     custo_inv = get_custo_inventario(df_inv, sku)
@@ -749,7 +743,7 @@ def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
     m1, m2, m3, m4 = st.columns(4)
     with m1:
         st.metric("Preço (Base Preços)", formatar_moeda(res["preco_bruto"]))
-        st.caption("Descrição: " + (desc if desc else "(sem descrição)"))
+        st.caption("PROD: " + (desc if desc else "(sem descrição)"))
     with m2:
         st.metric("Receita Base (pós VPC)", formatar_moeda(res["receita_base"]))
     with m3:
