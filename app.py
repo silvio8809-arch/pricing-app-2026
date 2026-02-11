@@ -8,24 +8,23 @@ import hashlib
 import re
 import socket
 from datetime import datetime
-from typing import Tuple, Dict, Optional
-from urllib.parse import urlparse, parse_qs
 from io import BytesIO
+from typing import Tuple, Dict, Optional, List
+from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
 import streamlit as st
 from supabase import create_client
-
 import requests
 
 # ==================== VERSÃO (LEAN) ====================
 APP_NAME = "Pricing 2026"
-__version__ = "3.4.3"
-__release_date__ = "2026-02-08"
+__version__ = "3.5.0"
+__release_date__ = "2026-02-10"
 __last_changes__ = [
-    "Leitura de Excel do Google Drive/Sheets via download HTTP (requests) + detecção de bloqueio/login",
-    "Fallback automático de URL para Google Drive (mais resiliente)",
-    "Mensagens acionáveis quando Google retorna HTML (login/consentimento/política de domínio)",
+    "Tela: Consulta de Preços (básico → ADM/Master) com MC e EBITDA",
+    "Tela: Configurações → Aba Parâmetros (somente ADM/Master) com persistência no Supabase",
+    "Motor de cálculo ajustado: bonificação sobre custo; VPC por cliente; MC alvo 16%; MOD 1%; tributos/devolução/comissão sobre receita",
 ]
 
 # ==================== CONFIGURAÇÃO INICIAL ====================
@@ -36,17 +35,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ==================== CONSTANTES ====================
+# ==================== CONSTANTES / GOVERNANÇA ====================
 class Config:
     CACHE_TTL = 300  # 5 minutos
-
-    TRIBUTOS = 0.15
-    DEVOLUCAO = 0.03
-    COMISSAO = 0.03
-    BONIFICACAO = 0.01
-    MC_ALVO = 0.09
-    OVERHEAD = 0.16
-    MOD = 0.01
 
     PERFIL_ADM = "ADM"
     PERFIL_MASTER = "Master"
@@ -59,7 +50,19 @@ class Config:
         "AP", "TO", "PI", "RN", "PB", "AL", "SE",
     ]
 
+    # Defaults (se Supabase não tiver config_parametros)
+    DEFAULT_PARAMS = {
+        "TRIBUTOS": 0.15,          # % sobre receita
+        "DEVOLUCAO": 0.03,         # % sobre receita
+        "COMISSAO": 0.03,          # % sobre receita
+        "BONIFICACAO_CUSTO": 0.01, # % sobre custo
+        "MC_ALVO": 0.16,           # % alvo (margem de contribuição alvo) - conforme instrução
+        "MOD_CUSTO": 0.01,         # % sobre custo
+        "OVERHEAD": 0.16,          # % sobre receita (fora do preço, mas entra no EBITDA)
+    }
 
+
+# ==================== HELPERS ====================
 def is_admin() -> bool:
     return st.session_state.get("perfil") in Config.PERFIS_ADMIN
 
@@ -76,9 +79,24 @@ def tradutor_erro(e: Exception) -> str:
         return "❌ HTTP 403: acesso negado (permissão insuficiente)"
     if "404" in err:
         return "❌ HTTP 404: arquivo não encontrado"
+    if "could not find the" in err:
+        return "❌ Estrutura do Supabase diferente do esperado (coluna não existe)"
     return "⚠️ Erro: " + str(e)
 
 
+def formatar_moeda(valor: float) -> str:
+    return ("R$ {0:,.2f}".format(float(valor))).replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def formatar_pct(frac: float) -> str:
+    return "{0:.2f}%".format(float(frac) * 100)
+
+
+def normalizar_texto(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip())
+
+
+# ==================== SUPABASE ====================
 def validar_supabase_url(url: str) -> Tuple[bool, str, str]:
     if not url:
         return False, "", "SUPABASE_URL vazio"
@@ -114,6 +132,7 @@ def init_connection():
 
     try:
         client = create_client(url, key)
+        # ping leve
         client.table("config_links").select("base_nome").limit(1).execute()
         return client
     except Exception as e:
@@ -146,9 +165,41 @@ def carregar_links(_supabase) -> Dict[str, str]:
     try:
         response = _supabase.table("config_links").select("*").execute()
         return {item["base_nome"]: item["url_link"] for item in response.data}
-    except Exception as e:
-        st.warning("Erro ao carregar links: " + tradutor_erro(e))
+    except Exception:
         return {}
+
+
+def salvar_parametro(supabase, nome: str, valor_percentual: float, grupo: str = "PRECIFICACAO") -> Tuple[bool, str]:
+    """
+    Tabela esperada: config_parametros (nome_parametro, valor_percentual, grupo)
+    Se a tabela/colunas não existirem, devolve mensagem clara.
+    """
+    payload = {"nome_parametro": nome, "valor_percentual": float(valor_percentual), "grupo": grupo}
+    try:
+        supabase.table("config_parametros").upsert(payload).execute()
+        return True, "OK"
+    except Exception as e:
+        return False, tradutor_erro(e)
+
+
+@st.cache_data(ttl=Config.CACHE_TTL)
+def carregar_parametros(supabase) -> Dict[str, float]:
+    """
+    Retorna dicionário com os parâmetros. Se não existir tabela, volta defaults.
+    """
+    params = dict(Config.DEFAULT_PARAMS)
+    try:
+        resp = supabase.table("config_parametros").select("*").execute()
+        if resp.data:
+            for row in resp.data:
+                nome = str(row.get("nome_parametro", "")).strip().upper()
+                val = row.get("valor_percentual", None)
+                if nome and val is not None:
+                    params[nome] = float(val)
+    except Exception:
+        # mantém defaults
+        pass
+    return params
 
 
 # ==================== LINKS (OneDrive/SharePoint + Google Drive/Sheets) ====================
@@ -208,10 +259,7 @@ def extrair_id_gsheets(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def converter_link_para_download(url: str) -> Tuple[list[str], bool, str, str]:
-    """
-    Retorna uma lista de URLs candidatas (fallbacks).
-    """
+def converter_link_para_download(url: str) -> Tuple[List[str], bool, str, str]:
     plataforma = identificar_plataforma_link(url)
 
     if plataforma == "onedrive":
@@ -227,7 +275,6 @@ def converter_link_para_download(url: str) -> Tuple[list[str], bool, str, str]:
         fid = extrair_id_gdrive(url)
         if not fid:
             return [], False, "Link Google Drive inválido (ID não encontrado)", plataforma
-        # Fallbacks
         return [
             f"https://drive.google.com/uc?export=download&id={fid}",
             f"https://drive.google.com/uc?id={fid}&export=download",
@@ -237,17 +284,17 @@ def converter_link_para_download(url: str) -> Tuple[list[str], bool, str, str]:
 
 
 def _baixar_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]:
-    """
-    Baixa o conteúdo via HTTP e retorna bytes.
-    Se o Google retornar HTML (login/bloqueio), devolve msg acionável.
-    """
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
         status = r.status_code
 
         if status in (401, 403):
-            return None, f"HTTP {status}: acesso negado. Ação: compartilhamento deve ser 'Qualquer pessoa com o link pode visualizar'. Se estiver em Drive corporativo/Shared Drive, pode haver política bloqueando acesso externo."
+            return None, (
+                f"HTTP {status}: acesso negado. "
+                "Ação: ajuste o compartilhamento para 'Qualquer pessoa com o link pode visualizar'. "
+                "Se for Drive corporativo/Shared Drive, pode existir política bloqueando."
+            )
 
         if status == 404:
             return None, "HTTP 404: arquivo não encontrado (link inválido ou arquivo movido)."
@@ -255,11 +302,12 @@ def _baixar_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]:
         ct = (r.headers.get("content-type") or "").lower()
         content = r.content or b""
 
-        # Google às vezes retorna HTML (página de login/consentimento) em vez do arquivo
         if "text/html" in ct or content.strip().lower().startswith(b"<!doctype html"):
-            return None, "Google retornou uma página (HTML) em vez do arquivo. Ação: confirme que o arquivo está público ('Qualquer pessoa com o link') e que exportação/download não está bloqueada por política do domínio."
+            return None, (
+                "Google retornou uma página (HTML) em vez do arquivo. "
+                "Ação: confirme arquivo público via link e que download/exportação não está bloqueado por política do domínio."
+            )
 
-        # Conteúdo aparentemente binário
         return content, None
 
     except Exception as e:
@@ -276,7 +324,6 @@ def load_excel_base(url: str) -> Tuple[pd.DataFrame, bool, str]:
         return pd.DataFrame(), False, msg
 
     ultimo_erro = None
-
     for u in urls:
         b, erro = _baixar_bytes(u)
         if b is None:
@@ -307,11 +354,226 @@ def autenticar_usuario(supabase, email: str, senha: str) -> Tuple[bool, Optional
         response = supabase.table("usuarios").select("*").eq("email", email).eq("senha", senha).execute()
         if response.data:
             u = response.data[0]
-            return True, {"email": u.get("email"), "perfil": u.get("perfil", Config.PERFIL_VENDEDOR), "nome": u.get("nome", "Usuário")}
+            return True, {
+                "email": u.get("email"),
+                "perfil": u.get("perfil", Config.PERFIL_VENDEDOR),
+                "nome": u.get("nome", "Usuário"),
+            }
         return False, None
     except Exception as e:
         st.error(tradutor_erro(e))
         return False, None
+
+
+# ==================== MOTOR DE CÁLCULO (AMVOX) ====================
+class CalculadoraAMVOX:
+    """
+    Premissas:
+    - Receita base = Preço Bruto após desconto VPC (quando aplicável)
+    - Tributos / Devolução / Comissão: % sobre receita base
+    - Bonificação: % sobre custo
+    - MOD: % sobre custo
+    - Frete: valor absoluto por UF
+    - MC = Receita Líquida - Custos Variáveis
+    - EBITDA = MC - Overhead (16% da receita base; custo fixo fora do preço, mas entra na margem EBITDA)
+    """
+
+    @staticmethod
+    def calcular(
+        preco_bruto: float,
+        custo_inventario: float,
+        frete_uf: float,
+        params: Dict[str, float],
+        aplicar_vpc: bool = False,
+        vpc_pct: float = 0.0,
+    ) -> Dict[str, float]:
+        preco_bruto = float(preco_bruto or 0)
+        custo_inventario = float(custo_inventario or 0)
+        frete_uf = float(frete_uf or 0)
+
+        trib = float(params.get("TRIBUTOS", 0.15))
+        devol = float(params.get("DEVOLUCAO", 0.03))
+        comis = float(params.get("COMISSAO", 0.03))
+        bon_custo = float(params.get("BONIFICACAO_CUSTO", 0.01))
+        mod_custo = float(params.get("MOD_CUSTO", 0.01))
+        overhead = float(params.get("OVERHEAD", 0.16))
+
+        vpc_pct = float(vpc_pct or 0)
+        vpc_aplicado = vpc_pct if aplicar_vpc else 0.0
+
+        receita_base = preco_bruto * (1 - vpc_aplicado)
+        receita_liquida = receita_base * (1 - trib)
+
+        custo_mod = custo_inventario * mod_custo
+        custo_bon = custo_inventario * bon_custo
+
+        custo_devol = receita_base * devol
+        custo_comis = receita_base * comis
+
+        custos_variaveis = (
+            custo_inventario
+            + custo_mod
+            + custo_bon
+            + frete_uf
+            + custo_devol
+            + custo_comis
+        )
+
+        margem_contribuicao_val = receita_liquida - custos_variaveis
+        mc_pct = (margem_contribuicao_val / receita_base) if receita_base > 0 else 0.0
+
+        overhead_val = receita_base * overhead
+        ebitda_val = margem_contribuicao_val - overhead_val
+        ebitda_pct = (ebitda_val / receita_base) if receita_base > 0 else 0.0
+
+        return {
+            "preco_bruto": preco_bruto,
+            "vpc_pct": vpc_aplicado,
+            "receita_base": receita_base,
+            "receita_liquida": receita_liquida,
+            "custo_inventario": custo_inventario,
+            "frete_uf": frete_uf,
+            "custo_mod": custo_mod,
+            "custo_bonificacao": custo_bon,
+            "custo_devolucao": custo_devol,
+            "custo_comissao": custo_comis,
+            "custos_variaveis": custos_variaveis,
+            "mc_val": margem_contribuicao_val,
+            "mc_pct": mc_pct,
+            "overhead_val": overhead_val,
+            "ebitda_val": ebitda_val,
+            "ebitda_pct": ebitda_pct,
+        }
+
+
+# ==================== EXTRAÇÃO DE COLUNAS (ROBUSTO) ====================
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.strip().lower()
+        if key in cols:
+            return cols[key]
+    return None
+
+
+def get_price_from_df_precos(df_precos: pd.DataFrame, sku: str) -> Optional[float]:
+    if df_precos.empty:
+        return None
+
+    col_sku = pick_col(df_precos, ["SKU", "Sku", "codigo", "código", "cod", "cód"])
+    if not col_sku:
+        return None
+
+    col_preco = pick_col(
+        df_precos,
+        ["Preço", "Preco", "Preço Atual", "Preco Atual", "Preço Venda", "Preco Venda", "PV", "Preco_Sem_IPI", "Preço Sem IPI", "Preco Sem IPI"],
+    )
+    if not col_preco:
+        return None
+
+    linha = df_precos[df_precos[col_sku].astype(str) == str(sku)]
+    if linha.empty:
+        return None
+
+    try:
+        return float(linha[col_preco].values[0])
+    except Exception:
+        return None
+
+
+def get_desc_from_df_precos(df_precos: pd.DataFrame, sku: str) -> str:
+    if df_precos.empty:
+        return ""
+    col_sku = pick_col(df_precos, ["SKU", "Sku", "codigo", "código", "cod", "cód"])
+    col_desc = pick_col(df_precos, ["Descrição", "Descricao", "DESCRICAO", "Produto", "Nome", "Item"])
+    if not col_sku or not col_desc:
+        return ""
+    linha = df_precos[df_precos[col_sku].astype(str) == str(sku)]
+    if linha.empty:
+        return ""
+    return normalizar_texto(linha[col_desc].values[0])
+
+
+def get_custo_inventario(df_inv: pd.DataFrame, sku: str) -> Optional[float]:
+    if df_inv.empty:
+        return None
+
+    col_sku = pick_col(df_inv, ["SKU", "Sku", "codigo", "código", "cod", "cód"])
+    col_custo = pick_col(df_inv, ["Custo Inventário", "Custo Inventario", "Custo", "CMV", "CPV"])
+
+    if not col_sku or not col_custo:
+        return None
+
+    linha = df_inv[df_inv[col_sku].astype(str) == str(sku)]
+    if linha.empty:
+        return None
+
+    try:
+        return float(linha[col_custo].values[0])
+    except Exception:
+        return None
+
+
+def get_frete_uf(df_frete: pd.DataFrame, uf: str) -> float:
+    if df_frete.empty:
+        return 0.0
+    col_uf = pick_col(df_frete, ["UF", "Estado", "Destino"])
+    col_val = pick_col(df_frete, ["Valor", "Frete", "Custo Frete", "Custo", "Valor Frete"])
+    if not col_uf or not col_val:
+        return 0.0
+    linha = df_frete[df_frete[col_uf].astype(str).str.upper() == str(uf).upper()]
+    if linha.empty:
+        return 0.0
+    try:
+        return float(linha[col_val].values[0])
+    except Exception:
+        return 0.0
+
+
+def get_vpc_cliente(df_vpc: pd.DataFrame, cliente: str, sku: Optional[str] = None) -> float:
+    """
+    VPC por cliente:
+    - procura % VPC por cliente (e opcionalmente SKU)
+    - colunas aceitas: Cliente / CNPJ / Razão Social + VPC / VPC% / Percentual
+    """
+    if df_vpc.empty:
+        return 0.0
+
+    col_cliente = pick_col(df_vpc, ["Cliente", "CNPJ", "Razão Social", "Razao Social", "Cliente Nome", "Nome"])
+    col_vpc = pick_col(df_vpc, ["VPC", "VPC%", "VPC %", "Percentual", "Perc", "Desconto", "Desconto%"])
+    col_sku = pick_col(df_vpc, ["SKU", "Sku", "codigo", "código", "cod", "cód"])
+
+    if not col_cliente or not col_vpc:
+        return 0.0
+
+    base = df_vpc[df_vpc[col_cliente].astype(str) == str(cliente)]
+
+    if sku and col_sku and not base.empty:
+        base_sku = base[base[col_sku].astype(str) == str(sku)]
+        if not base_sku.empty:
+            base = base_sku
+
+    if base.empty:
+        return 0.0
+
+    try:
+        v = float(base[col_vpc].values[0])
+        # se vier "16" significa 16%, se vier "0.16" já é fração
+        if v > 1.0:
+            v = v / 100.0
+        return max(0.0, min(v, 0.90))
+    except Exception:
+        return 0.0
+
+
+def listar_clientes(df_vpc: pd.DataFrame) -> List[str]:
+    if df_vpc.empty:
+        return []
+    col_cliente = pick_col(df_vpc, ["Cliente", "CNPJ", "Razão Social", "Razao Social", "Cliente Nome", "Nome"])
+    if not col_cliente:
+        return []
+    vals = sorted(df_vpc[col_cliente].astype(str).dropna().unique().tolist())
+    return [v for v in vals if v.strip()]
 
 
 # ==================== TELAS ====================
@@ -337,35 +599,36 @@ def tela_login(supabase):
                     return
                 ok, dados = autenticar_usuario(supabase, email, senha)
                 if ok:
-                    st.session_state.update({"autenticado": True, "perfil": dados["perfil"], "email": dados["email"], "nome": dados["nome"]})
+                    st.session_state.update(
+                        {"autenticado": True, "perfil": dados["perfil"], "email": dados["email"], "nome": dados["nome"]}
+                    )
                     st.success("✅ Login realizado!")
                     st.rerun()
                 else:
                     st.error("❌ E-mail ou senha incorretos")
 
 
-def tela_simulador(links: Dict[str, str]):
-    st.title("📊 Simulador de Margem EBITDA")
+def tela_consulta_precos(links: Dict[str, str], params: Dict[str, float]):
+    st.title("🔎 Consulta de Preços + Margens (MC / EBITDA)")
 
     with st.spinner("Carregando bases..."):
-        _, ok1, msg1 = load_excel_base(links.get("Preços Atuais", ""))
-        _, ok2, msg2 = load_excel_base(links.get("Inventário", ""))
-        _, ok3, msg3 = load_excel_base(links.get("Frete", ""))
-        _, ok4, msg4 = load_excel_base(links.get("VPC por cliente", ""))
+        df_precos, ok_p, msg_p = load_excel_base(links.get("Preços Atuais", ""))
+        df_inv, ok_i, msg_i = load_excel_base(links.get("Inventário", ""))
+        df_frete, ok_f, msg_f = load_excel_base(links.get("Frete", ""))
+        df_vpc, ok_v, msg_v = load_excel_base(links.get("VPC por cliente", ""))
 
     status = {
-        "Preços Atuais": (ok1, msg1),
-        "Inventário": (ok2, msg2),
-        "Frete": (ok3, msg3),
-        "VPC por cliente": (ok4, msg4),
+        "Preços Atuais": (ok_p, msg_p),
+        "Inventário": (ok_i, msg_i),
+        "Frete": (ok_f, msg_f),
+        "VPC por cliente": (ok_v, msg_v),
     }
 
     falhas = [n for n, (ok, _) in status.items() if not ok]
-
-    with st.expander("🔍 Status das Bases", expanded=bool(falhas)):
-        cols = st.columns(2)
-        for i, (nome, (ok, msg)) in enumerate(status.items()):
-            with cols[i % 2]:
+    with st.expander("📌 Status das Bases", expanded=bool(falhas)):
+        c = st.columns(2)
+        for idx, (nome, (ok, msg)) in enumerate(status.items()):
+            with c[idx % 2]:
                 if ok:
                     st.success("✅ " + nome)
                 else:
@@ -373,68 +636,244 @@ def tela_simulador(links: Dict[str, str]):
                     st.caption(msg)
 
     if falhas:
-        st.error("⚠️ Revise os links de: " + ", ".join(falhas))
+        st.error("⚠️ Não é possível consultar enquanto houver base indisponível: " + ", ".join(falhas))
         if is_admin():
-            st.info("💡 Acesse **⚙️ Configurações** para atualizar os links")
-        else:
-            st.info("💡 Solicite ao ADM/Master a atualização dos links em **⚙️ Configurações**")
+            st.info("💡 Vá em **⚙️ Configurações** para corrigir links e/ou parâmetros.")
         return
 
-    st.success("✅ Bases OK. Próximo passo: simulação completa (SKU/UF/Preço).")
+    # Seleção SKU / Descrição
+    col_sku_precos = pick_col(df_precos, ["SKU", "Sku", "codigo", "código", "cod", "cód"])
+    if not col_sku_precos:
+        st.error("❌ Base 'Preços Atuais' sem coluna SKU (ou equivalente). Padronize a coluna como 'SKU'.")
+        return
+
+    skus = sorted(df_precos[col_sku_precos].astype(str).dropna().unique().tolist())
+    skus = [s for s in skus if s.strip()]
+
+    st.divider()
+    st.subheader("📌 Parâmetros de consulta")
+
+    col_a, col_b, col_c = st.columns([2, 2, 2])
+
+    with col_a:
+        sku = st.selectbox("SKU", options=["Selecione..."] + skus)
+
+    with col_b:
+        modo = st.radio("Base de destino", options=["UF destino", "Cliente"], horizontal=True)
+
+    with col_c:
+        uf = None
+        cliente = None
+
+        if modo == "UF destino":
+            uf = st.selectbox("UF destino", options=Config.UFS_BRASIL)
+        else:
+            clientes = listar_clientes(df_vpc)
+            if clientes:
+                cliente = st.selectbox("Cliente", options=["Selecione..."] + clientes)
+            else:
+                st.warning("⚠️ Base 'VPC por cliente' não possui coluna Cliente (ou está vazia).")
+                cliente = "Selecione..."
+
+            # UF pode ser inferido do cliente (se existir na base). Se não, pede fallback.
+            uf_fallback = st.selectbox("UF destino (fallback)", options=Config.UFS_BRASIL, help="Usado para frete se UF do cliente não estiver disponível na base.")
+            uf = uf_fallback
+
+    if sku == "Selecione...":
+        st.info("💡 Selecione um SKU para consultar.")
+        return
+
+    # Preço e custo automáticos
+    preco_atual = get_price_from_df_precos(df_precos, sku)
+    custo_inv = get_custo_inventario(df_inv, sku)
+    desc = get_desc_from_df_precos(df_precos, sku)
+
+    if preco_atual is None:
+        st.error("❌ Não foi possível localizar a coluna de preço na base 'Preços Atuais'. Padronize como 'Preço' ou 'Preço Atual'.")
+        return
+
+    if custo_inv is None:
+        st.error("❌ Não foi possível localizar 'Custo Inventário' (ou equivalente) na base 'Inventário'. Padronize a coluna como 'Custo Inventário'.")
+        return
+
+    frete_uf = get_frete_uf(df_frete, uf or "")
+    vpc_pct = 0.0
+    aplicar_vpc = False
+
+    if modo == "Cliente" and cliente and cliente != "Selecione...":
+        vpc_pct = get_vpc_cliente(df_vpc, cliente, sku=sku)
+        aplicar_vpc = st.toggle("Aplicar VPC", value=(vpc_pct > 0))
+        st.caption("VPC previsto para o cliente: " + (formatar_pct(vpc_pct) if vpc_pct > 0 else "0,00%"))
+
+    # Cálculo
+    res = CalculadoraAMVOX.calcular(
+        preco_bruto=preco_atual,
+        custo_inventario=custo_inv,
+        frete_uf=frete_uf,
+        params=params,
+        aplicar_vpc=aplicar_vpc,
+        vpc_pct=vpc_pct,
+    )
+
+    st.divider()
+    st.subheader("📊 Resultado (Preço + Margens)")
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Preço (Base Preços Atuais)", formatar_moeda(res["preco_bruto"]))
+        if desc:
+            st.caption("Descrição: " + desc[:120])
+    with m2:
+        st.metric("Receita Base (pós VPC)", formatar_moeda(res["receita_base"]))
+    with m3:
+        st.metric("Margem de Contribuição", formatar_moeda(res["mc_val"]), formatar_pct(res["mc_pct"]))
+    with m4:
+        st.metric("EBITDA", formatar_moeda(res["ebitda_val"]), formatar_pct(res["ebitda_pct"]))
+
+    # Alvos e alertas
+    mc_alvo = float(params.get("MC_ALVO", 0.16))
+    st.divider()
+    if res["mc_pct"] < mc_alvo:
+        st.warning("⚠️ MC abaixo do alvo: " + formatar_pct(res["mc_pct"]) + " < " + formatar_pct(mc_alvo))
+    else:
+        st.success("✅ MC dentro do alvo: " + formatar_pct(res["mc_pct"]) + " ≥ " + formatar_pct(mc_alvo))
+
+    # Detalhamento
+    with st.expander("🧾 Detalhamento técnico (custos e componentes)"):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("**Componentes - Receita Base**")
+            st.write("- Receita base: " + formatar_moeda(res["receita_base"]))
+            st.write("- Receita líquida (pós tributos): " + formatar_moeda(res["receita_liquida"]))
+            st.write("- VPC aplicado: " + formatar_pct(res["vpc_pct"]))
+        with c2:
+            st.write("**Custos Variáveis**")
+            st.write("- Custo inventário: " + formatar_moeda(res["custo_inventario"]))
+            st.write("- MOD (sobre custo): " + formatar_moeda(res["custo_mod"]))
+            st.write("- Bonificação (sobre custo): " + formatar_moeda(res["custo_bonificacao"]))
+            st.write("- Frete UF: " + formatar_moeda(res["frete_uf"]))
+            st.write("- Devolução (sobre receita): " + formatar_moeda(res["custo_devolucao"]))
+            st.write("- Comissão (sobre receita): " + formatar_moeda(res["custo_comissao"]))
+            st.write("- **Total custos variáveis:** " + formatar_moeda(res["custos_variaveis"]))
+            st.divider()
+            st.write("**Overhead (fixo, fora do preço)**")
+            st.write("- Overhead: " + formatar_moeda(res["overhead_val"]))
 
 
-def tela_configuracoes(supabase, links: Dict[str, str]):
+def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]):
     st.title("⚙️ Configurações (ADM/Master)")
     if not is_admin():
         st.warning("⚠️ Acesso restrito a usuários ADM/Master")
         return
 
-    st.info("Cole links do OneDrive/SharePoint ou Google Drive/Sheets. Os arquivos precisam estar públicos via link (Leitor).")
+    tab1, tab2 = st.tabs(["🔗 Links das Bases", "🧩 Parâmetros de Precificação"])
 
-    bases = ["Preços Atuais", "Inventário", "Frete", "VPC por cliente"]
+    with tab1:
+        st.info("Cole links do OneDrive/SharePoint ou Google Drive/Sheets. Os arquivos precisam estar públicos via link (Leitor).")
+        bases = ["Preços Atuais", "Inventário", "Frete", "VPC por cliente"]
 
-    for base in bases:
-        url_salva = links.get(base, "")
-        with st.expander("📊 " + base, expanded=True):
-            link = st.text_area("Link da planilha", value=url_salva, key="link_" + base, height=110)
+        for base in bases:
+            url_salva = links.get(base, "")
+            with st.expander("📊 " + base, expanded=True):
+                link = st.text_area("Link da planilha", value=url_salva, key="link_" + base, height=110)
 
-            if link and link.strip():
-                link_limpo = link.strip()
-                plataforma = identificar_plataforma_link(link_limpo)
-                st.caption("Plataforma detectada: " + plataforma)
+                if link and link.strip():
+                    link_limpo = link.strip()
+                    plataforma = identificar_plataforma_link(link_limpo)
+                    st.caption("Plataforma detectada: " + plataforma)
 
-                urls, ok_conv, msg_conv, _plat = converter_link_para_download(link_limpo)
-                if ok_conv and urls:
-                    st.caption("Link(s) de download gerado(s):")
-                    for u in urls:
-                        st.code(u)
+                    urls, ok_conv, msg_conv, _plat = converter_link_para_download(link_limpo)
+                    if ok_conv and urls:
+                        st.caption("Link(s) de download gerado(s):")
+                        for u in urls:
+                            st.code(u)
+                    else:
+                        st.warning(msg_conv)
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        if st.button("🧪 Validar link", key="val_" + base, use_container_width=True):
+                            with st.spinner("Testando..."):
+                                _, okv, msgv = testar_link_tempo_real(link_limpo)
+                            if okv:
+                                st.success("✅ Link válido")
+                            else:
+                                st.error("❌ Link com erro")
+                                st.warning(msgv)
+
+                    with col_b:
+                        if st.button("💾 Salvar", key="save_" + base, type="primary", use_container_width=True):
+                            ok_save, msg_save = salvar_link_config(supabase, base, link_limpo)
+                            if ok_save:
+                                st.success("✅ " + base + " salvo com sucesso!")
+                                st.cache_data.clear()
+                                st.rerun()
+                            else:
+                                st.error("❌ Erro ao salvar: " + msg_save)
                 else:
-                    st.warning(msg_conv)
+                    st.warning("⚠️ Nenhum link configurado para esta base")
 
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    if st.button("🧪 Validar link", key="val_" + base, use_container_width=True):
-                        with st.spinner("Testando..."):
-                            _, okv, msgv = testar_link_tempo_real(link_limpo)
-                        if okv:
-                            st.success("✅ Link válido")
-                        else:
-                            st.error("❌ Link com erro")
-                            st.warning(msgv)
+    with tab2:
+        st.info("Parâmetros que intervêm no preço. Preenchimento manual, governado por ADM/Master.")
 
-                with col_b:
-                    if st.button("💾 Salvar", key="save_" + base, type="primary", use_container_width=True):
-                        ok_save, msg_save = salvar_link_config(supabase, base, link_limpo)
-                        if ok_save:
-                            st.success("✅ " + base + " salvo com sucesso!")
-                            st.cache_data.clear()
-                            st.rerun()
-                        else:
-                            st.error("❌ Erro ao salvar: " + msg_save)
+        # Inputs percentuais (fração, ex: 0.15 = 15%)
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            trib = st.number_input("Tributos sobre vendas (%)", min_value=0.0, max_value=100.0, value=float(params.get("TRIBUTOS", 0.15) * 100), step=0.1)
+            devol = st.number_input("Devoluções históricas (%)", min_value=0.0, max_value=100.0, value=float(params.get("DEVOLUCAO", 0.03) * 100), step=0.1)
+            comis = st.number_input("Comissão de vendas (%)", min_value=0.0, max_value=100.0, value=float(params.get("COMISSAO", 0.03) * 100), step=0.1)
+
+        with col2:
+            bon = st.number_input("Bonificações (% sobre custo)", min_value=0.0, max_value=100.0, value=float(params.get("BONIFICACAO_CUSTO", 0.01) * 100), step=0.1)
+            mod = st.number_input("MOD (% sobre custo)", min_value=0.0, max_value=100.0, value=float(params.get("MOD_CUSTO", 0.01) * 100), step=0.1)
+            overhead = st.number_input("Overhead corporativo (%)", min_value=0.0, max_value=100.0, value=float(params.get("OVERHEAD", 0.16) * 100), step=0.1)
+
+        with col3:
+            mc_alvo = st.number_input("Margem de Contribuição alvo (%)", min_value=0.0, max_value=100.0, value=float(params.get("MC_ALVO", 0.16) * 100), step=0.1)
+
+        st.divider()
+        if st.button("💾 Salvar Parâmetros", type="primary", use_container_width=True):
+            # grava em config_parametros
+            itens = {
+                "TRIBUTOS": trib / 100.0,
+                "DEVOLUCAO": devol / 100.0,
+                "COMISSAO": comis / 100.0,
+                "BONIFICACAO_CUSTO": bon / 100.0,
+                "MOD_CUSTO": mod / 100.0,
+                "OVERHEAD": overhead / 100.0,
+                "MC_ALVO": mc_alvo / 100.0,
+            }
+
+            falhas = []
+            for nome, val in itens.items():
+                ok, msg = salvar_parametro(supabase, nome, val, grupo="PRECIFICACAO")
+                if not ok:
+                    falhas.append(nome + ": " + msg)
+
+            if falhas:
+                st.error("❌ Não foi possível persistir todos os parâmetros no Supabase.")
+                st.warning("Detalhes:\n- " + "\n- ".join(falhas))
+                st.info("💡 Ação: confirme se existe a tabela config_parametros com colunas (nome_parametro, valor_percentual, grupo).")
             else:
-                st.warning("⚠️ Nenhum link configurado para esta base")
+                st.success("✅ Parâmetros salvos com sucesso!")
+                st.cache_data.clear()
+                st.rerun()
 
 
+def tela_sobre(params: Dict[str, float]):
+    st.title("ℹ️ Sobre o Sistema")
+    st.write("Versão: " + __version__ + " | " + __release_date__)
+    st.write("Últimas alterações:")
+    for c in __last_changes__:
+        st.write("- " + c)
+
+    with st.expander("📌 Parâmetros vigentes (snapshot)"):
+        for k in sorted(params.keys()):
+            st.write(f"- {k}: {formatar_pct(params[k])}")
+
+
+# ==================== APP PRINCIPAL ====================
 def main():
     inicializar_sessao()
     supabase = init_connection()
@@ -443,14 +882,19 @@ def main():
         tela_login(supabase)
         return
 
+    links = carregar_links(supabase)
+    params = carregar_parametros(supabase)
+
     with st.sidebar:
         st.title("👤 " + str(st.session_state.get("nome")))
         st.caption("🎭 " + str(st.session_state.get("perfil")))
         st.divider()
 
-        opcoes = ["📊 Simulador", "ℹ️ Sobre"]
+        # Menu: todos acessam Consulta
+        opcoes = ["🔎 Consulta de Preços", "ℹ️ Sobre"]
         if is_admin():
             opcoes.insert(1, "⚙️ Configurações")
+
         menu = st.radio("📍 Menu", opcoes, label_visibility="collapsed")
 
         st.divider()
@@ -462,18 +906,12 @@ def main():
         st.divider()
         st.caption("v" + __version__ + " | " + __release_date__)
 
-    links = carregar_links(supabase)
-
-    if menu == "📊 Simulador":
-        tela_simulador(links)
+    if menu == "🔎 Consulta de Preços":
+        tela_consulta_precos(links, params)
     elif menu == "⚙️ Configurações":
-        tela_configuracoes(supabase, links)
+        tela_configuracoes(supabase, links, params)
     else:
-        st.title("ℹ️ Sobre o Sistema")
-        st.write("Versão: " + __version__)
-        st.write("Últimas alterações:")
-        for c in __last_changes__:
-            st.write("- " + c)
+        tela_sobre(params)
 
 
 if __name__ == "__main__":
