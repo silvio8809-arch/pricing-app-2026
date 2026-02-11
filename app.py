@@ -1,6 +1,6 @@
 """
 PRICING 2026 - Sistema de Precificação Corporativa
-Versão: 3.8.2
+Versão: 3.8.3
 Última Atualização: 2026-02-10
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import socket
 import unicodedata
-from datetime import datetime, date, timedelta
+from datetime import datetime
 from io import BytesIO
 from typing import Tuple, Dict, Optional, List, Any
 from urllib.parse import urlparse, parse_qs
@@ -21,12 +21,12 @@ import requests
 
 # ==================== VERSÃO (LEAN) ====================
 APP_NAME = "Pricing 2026"
-__version__ = "3.8.2"
+__version__ = "3.8.3"
 __release_date__ = "2026-02-10"
 __last_changes__ = [
-    "Correção do SKU extraído do PROD (mantém sufixos alfanuméricos, ex.: 000503A94)",
-    "Inventário: custo buscado pela coluna CUSTO/CPV/CMV via DE→PARA",
-    "Melhorias defensivas no lookup de bases",
+    "Consulta: usuário seleciona APENAS pela descrição (sem código visível)",
+    "Chave interna: usa CODPRO (quando existir) para buscar custo e demais cálculos",
+    "Fallback inteligente: se CODPRO vier numérico/encurtado, recupera código pelo prefixo do PROD",
 ]
 
 # ==================== CONFIGURAÇÃO INICIAL ====================
@@ -52,7 +52,6 @@ class Config:
         "AP", "TO", "PI", "RN", "PB", "AL", "SE",
     ]
 
-    # parâmetros default (podem ser atualizados via config_parametros)
     DEFAULT_PARAMS = {
         "TRIBUTOS": 0.15,
         "DEVOLUCAO": 0.03,
@@ -104,21 +103,20 @@ def normalizar_texto(s: object) -> str:
 
 # ==================== DE→PARA (Governança de Dados) ====================
 DEPARA_COLUNAS: Dict[str, List[str]] = {
-    "SKU": ["SKU", "Produto", "CODPRO", "CodPro", "Código do Produto", "Codigo do Produto", "Codigo", "Código", "COD", "Cód"],
+    "CODPRO": ["CODPRO", "CodPro", "CODPROD", "Codigo Produto", "Código do Produto", "SKU", "Produto", "COD"],
     "PROD": ["PROD", "Produto/Descrição", "Produto Descrição", "Descricao Concatenada", "SKU + Descrição", "SKU+Descrição"],
     "DESCRICAO": ["Descrição", "Descricao", "Descrição do Produto", "Descricao do Produto", "Descrição do Item", "Descricao do Item", "Item", "Nome do Produto"],
 
-    # >>>> CUSTO INVENTÁRIO (o que você pediu): CUSTO é obrigatório aqui
+    # Inventário (Custo)
     "CUSTO_INVENTARIO": [
-        "CUSTO", "Custo", "Custo Inventário", "Custo Inventario", "Custo do Produto", "CUSTO DO PRODUTO",
-        "CMV", "C M V", "CPV", "C P V",
-        "Custo dos produtos/Mercadorias", "Custo Mercadoria", "Custo Mercadorias"
+        "CUSTO", "Custo", "Custo Inventário", "Custo Inventario", "Custo do Produto",
+        "CMV", "CPV", "Custo dos produtos/Mercadorias", "Custo Mercadoria"
     ],
 
     "UF": ["UF", "Estado", "Destino", "UF Destino"],
-    "FRETE_PCT": ["Frete%", "Frete %", "Percentual Frete", "Perc Frete", "Frete Perc", "FRETE_PCT", "FRETE %"],
-    "CLIENTE": ["Cliente", "Nome", "Nome do Cliente", "Razão Social", "Razao Social", "Cliente Nome", "CNPJ"],
-    "VPC": ["VPC", "VPC%", "VPC %", "Percentual", "Perc", "Desconto", "Desconto%", "VPC Perc", "VPC Percentual"],
+    "FRETE_PCT": ["Frete%", "Frete %", "Percentual Frete", "Perc Frete", "FRETE_PCT"],
+    "CLIENTE": ["Cliente", "Nome", "Nome do Cliente", "Razão Social", "Razao Social", "CNPJ"],
+    "VPC": ["VPC", "VPC%", "VPC %", "Percentual", "Desconto", "Desconto%"],
     "PRECO_ATUAL_SEM_IPI": ["PREÇO ATUAL S/ IPI", "PRECO ATUAL S/ IPI", "PREÇO ATUAL SEM IPI", "PRECO ATUAL SEM IPI"],
     "PRECO_ATUAL_COM_IPI": ["PREÇO ATUAL C/ IPI", "PRECO ATUAL C/ IPI", "PREÇO ATUAL COM IPI", "PRECO ATUAL COM IPI"],
 }
@@ -160,13 +158,11 @@ def pick_col(df: pd.DataFrame, candidatos: List[str]) -> Optional[str]:
     mapa = {normalizar_chave(c): c for c in df.columns}
     candidatos_expand = expandir_candidatos(candidatos)
 
-    # match direto
     for cand in candidatos_expand:
         k = normalizar_chave(cand)
         if k in mapa:
             return mapa[k]
 
-    # match parcial (fallback)
     for cand in candidatos_expand:
         k = normalizar_chave(cand)
         for col_norm, col_real in mapa.items():
@@ -174,6 +170,72 @@ def pick_col(df: pd.DataFrame, candidatos: List[str]) -> Optional[str]:
                 return col_real
 
     return None
+
+
+# ==================== COD / DESCRIÇÃO (normalizadores) ====================
+def cod_from_prod(prod: str) -> str:
+    """
+    PROD típico: "000503A94-SKD CAIXA AMPLIF ..."
+    Retorna: "000503A94"
+    """
+    p = normalizar_texto(prod)
+    if not p:
+        return ""
+    token = p.split(" ", 1)[0].strip()
+    token = token.split("-", 1)[0].strip()
+    token = re.sub(r"[^A-Za-z0-9_]+", "", token)
+    return token
+
+
+def norm_cod(valor: object) -> str:
+    """
+    Normaliza código, removendo efeitos comuns do Excel (ex.: 123.0).
+    """
+    s = normalizar_texto(valor)
+    if not s:
+        return ""
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+    return s.strip()
+
+
+def descricao_from_prod(prod: str, codpro: str) -> str:
+    """
+    Remove o prefixo 'CODPRO -' ou 'CODPRO-' de PROD, deixando só descrição.
+    Se não casar, devolve PROD sem o código inicial (se houver).
+    """
+    p = normalizar_texto(prod)
+    c = normalizar_texto(codpro)
+    if not p:
+        return ""
+
+    if c:
+        # remove "COD - " ou "COD-"
+        pat = r"^\s*" + re.escape(c) + r"\s*-\s*"
+        desc = re.sub(pat, "", p, flags=re.IGNORECASE).strip()
+        if desc and desc != p:
+            return desc
+
+    # fallback: remove o primeiro token antes do hífen
+    # ex: "000503A94-SKD CAIXA..." -> "SKD CAIXA..."
+    if "-" in p:
+        parts = p.split("-", 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+
+    return p
+
+
+def option_unico_visual(texto: str, idx: int) -> str:
+    """
+    Garante unicidade no selectbox sem poluir a tela:
+    adiciona caractere invisível (zero-width) no final quando necessário.
+    """
+    return texto + ("\u200b" * idx)
+
+
+def strip_invisiveis(texto: str) -> str:
+    return (texto or "").replace("\u200b", "").strip()
 
 
 # ==================== SUPABASE ====================
@@ -212,7 +274,6 @@ def init_connection():
 
     try:
         client = create_client(url, key)
-        # sanity check
         client.table("config_links").select("base_nome").limit(1).execute()
         return client
     except Exception as e:
@@ -223,14 +284,6 @@ def init_connection():
 def supabase_coluna_existe(supabase, tabela: str, coluna: str) -> bool:
     try:
         supabase.table(tabela).select(coluna).limit(1).execute()
-        return True
-    except Exception:
-        return False
-
-
-def supabase_tabela_existe(supabase, tabela: str) -> bool:
-    try:
-        supabase.table(tabela).select("*").limit(1).execute()
         return True
     except Exception:
         return False
@@ -453,41 +506,78 @@ class PrecificacaoOficialAMVOX:
 
 
 # ==================== LOOKUPS (performance) ====================
-def extrair_sku_de_prod(prod: str) -> str:
-    """
-    >>> CORRIGIDO (v3.8.2)
-    PROD pode vir como: 000503A94-SKD CAIXA AMPLIF...
-    Regra: pega o token inicial (até o primeiro espaço) e corta no primeiro hífen.
-    Assim: 000503A94-SKD -> 000503A94 (mantém sufixo A94).
-    """
-    p = normalizar_texto(prod)
-    if not p:
-        return ""
-
-    token = p.split(" ", 1)[0].strip()          # "000503A94-SKD"
-    token = token.split("-", 1)[0].strip()      # "000503A94"
-    token = re.sub(r"[^A-Za-z0-9_]+", "", token)
-    return token
-
-
 def build_precos_lookup(df_precos: pd.DataFrame) -> Dict[str, Any]:
-    out: Dict[str, Any] = {"prod_list": [], "prod_to_sku": {}, "clientes_list": []}
+    """
+    Saída:
+      - options_desc: lista de descrições (únicas visualmente)
+      - opt_map: option -> {codpro, desc, prod}
+      - clientes_list (se existir)
+    """
+    out: Dict[str, Any] = {"options_desc": [], "opt_map": {}, "clientes_list": []}
     if df_precos is None or df_precos.empty:
         return out
 
+    col_codpro = pick_col(df_precos, ["CODPRO"])
     col_prod = pick_col(df_precos, ["PROD"])
+    col_desc = pick_col(df_precos, ["DESCRICAO"])
     col_cli = pick_col(df_precos, ["CLIENTE"])
 
-    if not col_prod:
+    if not col_prod and not col_desc:
         return out
 
     df = df_precos.copy()
-    df[col_prod] = df[col_prod].apply(normalizar_texto)
-    df = df[df[col_prod] != ""]
-    prods = sorted(df[col_prod].dropna().unique().tolist())
-    out["prod_list"] = prods
-    for p in prods:
-        out["prod_to_sku"][p] = extrair_sku_de_prod(p)
+
+    if col_prod:
+        df[col_prod] = df[col_prod].apply(normalizar_texto)
+    if col_desc:
+        df[col_desc] = df[col_desc].apply(normalizar_texto)
+    if col_codpro:
+        df[col_codpro] = df[col_codpro].apply(norm_cod)
+
+    # montar descrição "limpa" para tela (sem código)
+    desc_list: List[str] = []
+    opt_map: Dict[str, Dict[str, str]] = {}
+
+    # contador para duplicidades (mesma descrição)
+    seen_count: Dict[str, int] = {}
+
+    for _, r in df.iterrows():
+        prod = normalizar_texto(r[col_prod]) if col_prod else ""
+        desc_raw = normalizar_texto(r[col_desc]) if col_desc else ""
+
+        codpro = norm_cod(r[col_codpro]) if col_codpro else ""
+        if codpro:
+            # se CODPRO veio numérico e PROD tem zeros/sufixos, prioriza código do PROD
+            cod_prod = cod_from_prod(prod)
+            if cod_prod and len(cod_prod) > len(codpro):
+                codpro = cod_prod
+        else:
+            # se não há CODPRO, tenta pegar do PROD (último recurso)
+            codpro = cod_from_prod(prod)
+
+        if not codpro:
+            continue
+
+        if desc_raw:
+            desc_limpa = desc_raw
+        else:
+            desc_limpa = descricao_from_prod(prod, codpro)
+
+        desc_limpa = desc_limpa.strip()
+        if not desc_limpa:
+            continue
+
+        base_key = desc_limpa.lower()
+        seen_count[base_key] = seen_count.get(base_key, 0) + 1
+        option = option_unico_visual(desc_limpa, seen_count[base_key])
+
+        desc_list.append(option)
+        opt_map[option] = {"codpro": codpro, "desc": desc_limpa, "prod": prod}
+
+    # ordenar pelo texto visível (sem invisíveis)
+    desc_list_sorted = sorted(desc_list, key=lambda x: strip_invisiveis(x).lower())
+    out["options_desc"] = desc_list_sorted
+    out["opt_map"] = opt_map
 
     if col_cli:
         df[col_cli] = df[col_cli].astype(str)
@@ -499,24 +589,26 @@ def build_precos_lookup(df_precos: pd.DataFrame) -> Dict[str, Any]:
 def build_inv_lookup(df_inv: pd.DataFrame) -> Dict[str, float]:
     """
     Inventário:
-    - SKU/CODPRO/Produto
-    - CUSTO (obrigatório, via DE→PARA)
+      - CODPRO/SKU/Produto (chave)
+      - CUSTO (via DE→PARA)
     """
     if df_inv is None or df_inv.empty:
         return {}
 
-    col_sku = pick_col(df_inv, ["SKU"])
-    col_custo = pick_col(df_inv, ["CUSTO_INVENTARIO"])  # aqui CUSTO entra pelo DE→PARA
+    col_cod = pick_col(df_inv, ["CODPRO"])
+    col_custo = pick_col(df_inv, ["CUSTO_INVENTARIO"])
 
-    if not col_sku or not col_custo:
+    if not col_cod or not col_custo:
         return {}
 
     out: Dict[str, float] = {}
-    tmp = df_inv[[col_sku, col_custo]].dropna()
+    tmp = df_inv[[col_cod, col_custo]].dropna()
     for _, r in tmp.iterrows():
-        sku = str(r[col_sku]).strip()
+        cod = norm_cod(r[col_cod])
+        if not cod:
+            continue
         try:
-            out[sku] = float(r[col_custo])
+            out[cod] = float(r[col_custo])
         except Exception:
             continue
     return out
@@ -550,7 +642,8 @@ def inicializar_sessao():
         if k not in st.session_state:
             st.session_state[k] = v
 
-    persist_defaults = {"last_prod": "", "last_modo": "UF destino", "last_uf": "SP", "last_cliente": ""}
+    # persistência da última consulta (usuário não perde contexto ao trocar de tela)
+    persist_defaults = {"last_desc_option": "", "last_modo": "UF destino", "last_uf": "SP", "last_cliente": ""}
     for k, v in persist_defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -586,13 +679,9 @@ def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, floa
         df_inv, ok_i, msg_i = load_excel_base(links.get("Inventário", ""))
         df_frete, ok_f, msg_f = load_excel_base(links.get("Frete", ""))
 
-    status = {
-        "Preços Atuais": (ok_p, msg_p),
-        "Inventário": (ok_i, msg_i),
-        "Frete": (ok_f, msg_f),
-    }
-
+    status = {"Preços Atuais": (ok_p, msg_p), "Inventário": (ok_i, msg_i), "Frete": (ok_f, msg_f)}
     falhas = [n for n, (ok, _) in status.items() if not ok]
+
     with st.expander("📌 Status das Bases", expanded=bool(falhas)):
         c = st.columns(3)
         for idx, (nome, (ok, msg)) in enumerate(status.items()):
@@ -605,31 +694,34 @@ def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, floa
 
     if falhas:
         st.error("⚠️ Não é possível consultar enquanto houver base indisponível: " + ", ".join(falhas))
+        st.info("Ação: vá em Configurações (ADM/Master) e atualize os links.")
         return
 
     precos_lk = build_precos_lookup(df_precos)
     inv_lk = build_inv_lookup(df_inv)
     frete_lk = build_frete_lookup(df_frete)
 
-    prod_list = precos_lk.get("prod_list", [])
-    if not prod_list:
-        st.error("❌ A base 'Preços Atuais' precisa ter a coluna PROD.")
+    options_desc = precos_lk.get("options_desc", [])
+    opt_map = precos_lk.get("opt_map", {})
+
+    if not options_desc:
+        st.error("❌ Não consegui montar a lista de itens. Confirme se Preços Atuais tem PROD (ou Descrição) e CODPRO.")
         return
 
     st.divider()
     st.subheader("📌 Parâmetros de consulta")
 
-    col_a, col_b, col_c = st.columns([5, 2, 2])
+    col_a, col_b, col_c = st.columns([6, 2, 2])
 
     with col_a:
-        last_prod = st.session_state.get("last_prod", "")
-        options = ["Selecione..."] + prod_list
-        idx = options.index(last_prod) if last_prod in options else 0
-        prod = st.selectbox("Buscar por PROD (já contém SKU + Descrição)", options=options, index=idx)
-        if prod == "Selecione...":
-            st.info("💡 Selecione um PROD para consultar.")
+        last_opt = st.session_state.get("last_desc_option", "")
+        options = ["Selecione..."] + options_desc
+        idx = options.index(last_opt) if last_opt in options else 0
+        desc_opt = st.selectbox("Buscar pela descrição do produto", options=options, index=idx)
+        if desc_opt == "Selecione...":
+            st.info("💡 Selecione uma descrição para consultar.")
             return
-        st.session_state["last_prod"] = prod
+        st.session_state["last_desc_option"] = desc_opt
 
     with col_b:
         modo = st.radio(
@@ -648,18 +740,26 @@ def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, floa
         )
         st.session_state["last_uf"] = uf
 
-    sku = precos_lk.get("prod_to_sku", {}).get(prod, "") or extrair_sku_de_prod(prod)
-    if not sku:
-        st.error("❌ Não consegui extrair SKU a partir do PROD.")
+    item = opt_map.get(desc_opt)
+    if not item:
+        st.error("❌ Falha ao resolver o item selecionado (mapeamento interno).")
         return
 
-    st.caption(f"SKU (extraído do PROD): **{sku}**")
+    codpro = item.get("codpro", "")
+    desc_limpa = item.get("desc", strip_invisiveis(desc_opt))
 
-    # >>>> aqui é onde você pediu: custo vem do Inventário, coluna CUSTO
-    custo = inv_lk.get(sku)
+    if not codpro:
+        st.error("❌ Não consegui identificar o código interno (CODPRO).")
+        return
+
+    # custo do inventário por CODPRO
+    custo = inv_lk.get(codpro)
     if custo is None:
-        st.error("❌ Não achei o Custo (CUSTO/CPV/CMV) na base 'Inventário' para esse SKU.")
-        st.info("Ação: confirme se no Inventário existe uma coluna 'CUSTO' e se o SKU no Inventário é exatamente igual ao extraído do PROD.")
+        st.error("❌ Não achei o Custo (coluna CUSTO/CPV/CMV) na base 'Inventário' para esse item.")
+        st.info("Ação: alinhar o CODPRO do Inventário com o CODPRO da base Preços Atuais.")
+        if is_admin():
+            with st.expander("🧾 Detalhe técnico (ADM/Master)"):
+                st.write(f"CODPRO usado no lookup: **{codpro}**")
         return
 
     frete_pct = frete_lk.get(str(uf).upper())
@@ -681,6 +781,9 @@ def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, floa
 
     st.divider()
     st.subheader("📈 Resultado (Preço Sugerido)")
+
+    st.caption(f"Item selecionado: **{desc_limpa}**")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("Custo (Inventário)", formatar_moeda(custo))
@@ -689,7 +792,9 @@ def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, floa
     with c3:
         st.metric("Preço Sugerido s/ IPI", formatar_moeda(preco_sugerido_sem_ipi))
 
-    st.success("✅ Custo encontrado via Inventário (coluna CUSTO) e cálculo executado.")
+    if is_admin():
+        with st.expander("🧾 Detalhe técnico (ADM/Master)"):
+            st.write(f"CODPRO (chave interna): **{codpro}**")
 
 
 def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]):
