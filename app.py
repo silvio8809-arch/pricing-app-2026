@@ -1,101 +1,140 @@
 """
 PRICING 2026 - Sistema de Precificação Corporativa
-Versão: 3.9.2
-Última Atualização: 2026-02-11
-Mudanças (últimas):
-- Fallback CPV mais aderente à operação: CPV = ABS(CMV)/ABS(QTD_FAT)
-- Quando houver múltiplas linhas no fallback: prioriza maior Nº Nota; se não existir, prioriza data mais recente
+Versão: 3.9.0
+Última Atualização: 2026-02-13
+
+Últimas alterações (resumo):
+- MC Alvo por Linha de Produto via tabela (AUDIO=40%, demais=30%) com seed se vazio
+- Perfis ADM e Master com o mesmo nível de acesso (admin)
+- Melhoria de performance: consulta por botão (evita recarregar bases a cada interação)
+- Suporte a links OneDrive/SharePoint e Google Drive (export automático)
+- Auditoria/governança detalhada (visível apenas para ADM/Master)
+- DE/PARA de colunas (SKU/PROD/CODPRO etc.) + CPV/CMV/CUSTO
+- Frete por UF (%) aplicado corretamente (base receita COM IPI)
+- Preço atual (sem e com IPI) + IPI% derivado das colunas do preço atual
 """
 
-from __future__ import annotations
-
-import hashlib
 import re
-from dataclasses import dataclass
+import hashlib
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import pandas as pd
+import requests
 import streamlit as st
 from supabase import create_client
 
-
-# ==================== CONTROLE DE VERSÃO ====================
-__version__ = "3.9.2"
-__release_date__ = "2026-02-11"
+# ==================== CONTROLE DE VERSÃO (compacto) ====================
+__version__ = "3.9.0"
+__release_date__ = "2026-02-13"
 __last_changes__ = [
-    "Fallback CPV: ABS(CMV)/ABS(QTD_FAT), priorizando maior Nº Nota (ou data mais recente)",
-    "Mantido: Política v3 (Overhead sobre Preço COM IPI) + performance sob demanda + governança ADM/Master",
+    "MC Alvo por Linha (AUDIO=40%, demais=30%) em tabela + seed se vazio",
+    "ADM e Master equivalentes (admin)",
+    "Consulta por botão para performance",
+    "Suporte OneDrive/SharePoint + Google Drive (export)",
+    "Auditoria/governança detalhada (apenas admin)",
+    "DE/PARA de colunas + fallback CPV=ABS(CMV)/ABS(QTD_FAT)",
+    "Frete UF (%) aplicado na receita com IPI",
+    "Preço atual (s/ IPI e c/ IPI) + IPI% derivado"
 ]
 
-
-# ==================== UI ====================
+# ==================== CONFIGURAÇÃO STREAMLIT ====================
 st.set_page_config(
     page_title=f"Pricing 2026 - v{__version__}",
     page_icon="💰",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
+# ==================== CONSTANTES / TABELAS ====================
+class Config:
+    CACHE_TTL = 600  # 10 min (bases)
+    UFS_BRASIL = [
+        "AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA",
+        "PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"
+    ]
+
+    # Tabelas Supabase (ajuste aqui se no seu banco estiver com outro nome)
+    TBL_USUARIOS = "usuarios"
+    TBL_CONFIG_LINKS = "config_links"
+    TBL_CONFIG_PARAM = "config_parametros"
+    TBL_CONFIG_MARGENS = "config_margens_linha"     # <-- nova: margens por linha (MC alvo)
+    TBL_LOGS = "log_simulacoes"                      # logs de simulação
+
+    # Chaves/nomes padrão para parâmetros (config_parametros)
+    PARAM_TRIBUTOS = "tributos"
+    PARAM_DEVOLUCOES = "devolucoes"
+    PARAM_COMISSAO = "comissao"
+    PARAM_MOD = "mod"
+    PARAM_BONIFICACAO = "bonificacao"
+    PARAM_OVERHEAD = "overhead"
+
+    # Grupo sugerido
+    GROUP_CALC = "calc"
+
+    # Seed inicial (SOMENTE se tabela estiver vazia) - não “fixa regra”, apenas valores iniciais padrão
+    DEFAULT_MARGENS_LINHA = [
+        {"linha_produto": "AUDIO", "margem_alvo": 0.40},
+        {"linha_produto": "LAR", "margem_alvo": 0.30},
+        {"linha_produto": "INFORMATICA", "margem_alvo": 0.30},
+        {"linha_produto": "CLIMA", "margem_alvo": 0.30},
+        {"linha_produto": "VIDEO", "margem_alvo": 0.30},
+    ]
+
+    # Defaults de parâmetros (SOMENTE se tabela estiver vazia)
+    DEFAULT_PARAMS = {
+        PARAM_TRIBUTOS: 0.15,
+        PARAM_DEVOLUCOES: 0.03,
+        PARAM_COMISSAO: 0.03,
+        PARAM_MOD: 0.01,
+        PARAM_BONIFICACAO: 0.01,   # base custo
+        PARAM_OVERHEAD: 0.16       # base receita bruta (Preço com IPI)
+    }
 
 # ==================== DE/PARA (COLUNAS) ====================
-DEPARA = {
-    "SKU": ["SKU", "CODPRO", "CODIGO", "CÓDIGO", "PRODUTO", "COD_PROD", "COD PROD", "COD. PROD", "CODPROD"],
-    "PROD": ["PROD", "DESCRICAO", "DESCRIÇÃO", "DESCRICAO DO PRODUTO", "DESCRIÇÃO DO PRODUTO", "DESCRICAO DO ITEM"],
-    "CLIENTE": ["CLIENTE", "NOME", "NOME CLIENTE", "RAZAO", "RAZÃO", "RAZAO SOCIAL", "RAZÃO SOCIAL"],
+DEPARA_COLS = {
+    "SKU": ["SKU", "CODPRO", "COD_PRO", "PRODUTO", "PROD", "CODIGO", "CÓDIGO", "COD"],
+    "PROD_DESC": ["PROD", "PRODUTO", "DESCRICAO", "DESCRIÇÃO", "DESCRICAO DO PRODUTO", "DESCRIÇÃO DO ITEM", "ITEM"],
+    "CLIENTE": ["CLIENTE", "NOME", "NOME CLIENTE", "RAZAO SOCIAL", "RAZÃO SOCIAL", "DESTINATARIO", "DESTINATÁRIO"],
     "UF": ["UF", "ESTADO", "UF DESTINO", "UF_DESTINO"],
-    "CUSTO": ["CUSTO", "CUSTO INVENTARIO", "CUSTO INVENTÁRIO", "CPV", "CMV", "CUSTO DOS PRODUTOS", "CUSTO MERCADORIA"],
-    "CMV": ["CMV", "CPV", "CUSTO", "CUSTO MERCADORIA", "CUSTO DOS PRODUTOS"],
-    "QTD_FAT": ["QTD FAT", "QTDFAT", "QTD_FAT", "QUANTIDADE", "QTD", "QTD FATURADA", "QTD_FATURADA"],
-    "PRECO_S_IPI": ["PRECO ATUAL S/ IPI", "PREÇO ATUAL S/ IPI", "PRECO S/ IPI", "PREÇO S/ IPI", "PRECO_SEM_IPI"],
-    "PRECO_C_IPI": ["PRECO ATUAL C/ IPI", "PREÇO ATUAL C/ IPI", "PRECO C/ IPI", "PREÇO C/ IPI", "PRECO_COM_IPI"],
-    "FRETE_PCT": ["FRETE", "FRETE %", "FRETE_PCT", "PERC_FRETE", "% FRETE", "FRETE_MEDIO", "FRETE MÉDIO"],
-    "VPC_PCT": ["VPC", "VPC %", "VPC_PCT", "PERC_VPC", "% VPC"],
-    # NOVO: para priorizar a "linha com o número de nota maior"
-    "NOTA": ["NOTA", "NF", "NFE", "Nº NOTA", "NUM NOTA", "NUMERO NOTA", "NUMERO DA NOTA", "NRO NOTA", "NR NOTA"],
-    # fallback alternativo se não houver nota
-    "DATA": ["DATA", "DATA EMISSAO", "DATA EMISSÃO", "DT EMISSAO", "DT EMISSÃO", "DATA_NOTA", "DT_NOTA", "EMISSAO"],
+    "CUSTO": ["CUSTO", "CUSTO INVENTARIO", "CUSTO INVENTÁRIO", "CPV", "CMV", "CUSTO DOS PRODUTOS", "CUSTO MERCADORIA", "CUSTO PRODUTO"],
+    "CMV": ["CMV", "CUSTO MERCADORIA", "CUSTO MERCADORIA TOTAL", "VALOR CMV"],
+    "QTD_FAT": ["QTD FAT", "QTD_FAT", "QUANTIDADE", "QTD", "QTDE", "QTD. FAT"],
+    "NUM_NF": ["NF", "NOTA", "NUM NOTA", "NUMERO NOTA", "NÚMERO NOTA", "NUM_NF", "NUMERO"],
+    "DATA": ["DATA", "DT", "DATA EMISSAO", "DATA EMISSÃO", "EMISSAO", "EMISSÃO"],
+    "PRECO_ATUAL_S_IPI": ["PREÇO ATUAL S/ IPI", "PRECO ATUAL S/ IPI", "PRECO_S_IPI", "PRECO SEM IPI", "VALOR S/ IPI"],
+    "PRECO_ATUAL_C_IPI": ["PREÇO ATUAL C/ IPI", "PRECO ATUAL C/ IPI", "PRECO_C_IPI", "PRECO COM IPI", "VALOR C/ IPI"],
+    "VPC_PERC": ["VPC", "VPC_%", "VPC PERCENTUAL", "DESCONTO VPC", "DESCONTO", "VPC PERC"],
+    "FRETE_PERC": ["FRETE_%", "FRETE", "FRETE UF", "FRETE_UF", "PERC FRETE", "% FRETE", "FRETE MEDIO", "FRETE MÉDIO", "FRETE PERCENTUAL"],
+    "LINHA_PRODUTO": ["LINHA", "LINHA PRODUTO", "FAMILIA", "FAMÍLIA", "CATEGORIA", "LINHA_PRODUTO"]
 }
 
-BASES_NOMES = ["Preços Atuais", "Inventário", "Frete UF", "VPC por cliente"]
+# ==================== UTILITÁRIAS ====================
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
 
+def is_admin(perfil: str) -> bool:
+    # ADM e Master equivalentes
+    return (perfil or "").strip().lower() in ["adm", "admin", "master"]
 
-# ==================== CONFIG (DEFAULTS) ====================
-@dataclass(frozen=True)
-class DefaultParams:
-    TRIBUTOS: float = 0.15
-    DEVOLUCOES: float = 0.03
-    COMISSAO: float = 0.03
-    FRETE_UF: float = 0.00
-    MARGEM_ALVO: float = 0.16
-    VPC: float = 0.00
-    MOD: float = 0.01
-    BONIFICACAO: float = 0.01
-    OVERHEAD: float = 0.16  # Política v3: incide sobre Preço COM IPI
-
-
-CACHE_TTL = 600  # 10min
-
-
-# ==================== UTIL ====================
-def norm_txt(s: str) -> str:
-    if s is None:
-        return ""
-    s2 = str(s).strip()
-    s2 = re.sub(r"\s+", " ", s2)
-    return s2
-
-
-def norm_col(col: str) -> str:
-    c = norm_txt(col).upper()
-    c = c.replace("Á", "A").replace("Ã", "A").replace("Â", "A")
-    c = c.replace("É", "E").replace("Ê", "E")
-    c = c.replace("Í", "I")
-    c = c.replace("Ó", "O").replace("Ô", "O").replace("Õ", "O")
-    c = c.replace("Ú", "U")
-    c = re.sub(r"[^A-Z0-9/ %_]", "", c)
-    return c
-
+def tradutor_erro(e: Exception) -> str:
+    err = str(e).lower()
+    mapa = {
+        "config_links": "Tabela de links não encontrada no Supabase.",
+        "config_parametros": "Tabela de parâmetros não encontrada no Supabase.",
+        "config_margens_linha": "Tabela de margens por linha não encontrada no Supabase.",
+        "invalid api key": "Chave de API inválida. Revise SUPABASE_KEY no Secrets.",
+        "name or service not known": "URL do Supabase inválida (erro de DNS). Revise SUPABASE_URL.",
+        "401": "Acesso não autorizado (401). Verifique credenciais/permissões.",
+        "403": "Acesso negado (403). O link exige permissão/login.",
+        "404": "Arquivo não encontrado (404). Verifique o link.",
+        "timeout": "Tempo esgotado. Tente novamente.",
+        "ssl": "Falha SSL. Tente novamente."
+    }
+    for k, v in mapa.items():
+        if k in err:
+            return f"❌ {v}"
+    return f"⚠️ Erro: {str(e)}"
 
 def formatar_moeda(v: float) -> str:
     try:
@@ -103,987 +142,1067 @@ def formatar_moeda(v: float) -> str:
     except Exception:
         return "R$ 0,00"
 
-
-def formatar_pct(v: float) -> str:
+def formatar_pct(p: float) -> str:
     try:
-        return f"{float(v)*100:.2f}%"
+        return f"{float(p)*100:.2f}%"
     except Exception:
-        return "0,00%"
+        return "0.00%"
 
+def limpar_texto(x: str) -> str:
+    x = "" if x is None else str(x)
+    x = x.strip()
+    x = re.sub(r"\s+", " ", x)
+    return x
 
-def sha256_hex(s: str) -> str:
-    import hashlib
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+def normalizar_col(col: str) -> str:
+    col = (col or "").strip().lower()
+    col = col.replace("ç", "c").replace("ã", "a").replace("á", "a").replace("à", "a").replace("â", "a")
+    col = col.replace("é", "e").replace("ê", "e").replace("í", "i").replace("ó", "o").replace("ô", "o").replace("ú", "u")
+    col = re.sub(r"[^a-z0-9/%_ ]+", "", col)
+    col = re.sub(r"\s+", " ", col).strip()
+    return col
 
-
-def is_admin(perfil: str) -> bool:
-    p = (perfil or "").strip().lower()
-    return p in ["adm", "admin", "master"]
-
-
-def pick_col(df: pd.DataFrame, logical_name: str) -> Optional[str]:
+def find_col(df: pd.DataFrame, keys: List[str]) -> Optional[str]:
     if df is None or df.empty:
         return None
-    cols = list(df.columns)
-    cols_norm = {c: norm_col(c) for c in cols}
-    candidates = [norm_col(x) for x in DEPARA.get(logical_name, [])]
-
-    for c in cols:
-        if cols_norm[c] in candidates:
-            return c
-
-    for c in cols:
-        cn = cols_norm[c]
-        for cand in candidates:
-            if cand and cand in cn:
-                return c
+    cols_map = {normalizar_col(c): c for c in df.columns}
+    for k in keys:
+        nk = normalizar_col(k)
+        if nk in cols_map:
+            return cols_map[nk]
+    # tentativa por "contains"
+    for nk, orig in cols_map.items():
+        for k in keys:
+            if normalizar_col(k) in nk:
+                return orig
     return None
 
-
-def tradutor_erro(e: Exception) -> str:
-    msg = str(e)
-    low = msg.lower()
-    if "401" in low or "unauthorized" in low:
-        return "HTTP 401 (Unauthorized): o link exige login/permissão. Ajuste o compartilhamento para 'Qualquer pessoa com o link pode visualizar' e gere um novo link."
-    if "403" in low or "forbidden" in low:
-        return "HTTP 403 (Forbidden): acesso negado. Verifique permissões do link."
-    if "404" in low or "not found" in low:
-        return "HTTP 404: arquivo não encontrado. Verifique o link."
-    if "name or service not known" in low:
-        return "Falha de DNS: confira o SUPABASE_URL no Secrets (está incorreto ou incompleto)."
-    if "could not find the" in low and "column" in low:
-        return "Erro de schema no Supabase: falta coluna esperada na tabela."
-    return f"Erro: {msg}"
-
-
-# ==================== LINKS (ONEDRIVE / GOOGLE) ====================
-def detect_plataforma(url: str) -> str:
+# ==================== LINKS (OneDrive/SharePoint + Google Drive) ====================
+def detectar_plataforma_link(url: str) -> str:
     u = (url or "").lower()
-    if "docs.google.com/spreadsheets" in u:
-        return "gsheets"
-    if "drive.google.com" in u:
+    if "docs.google.com" in u or "drive.google.com" in u:
         return "gdrive"
     if "sharepoint.com" in u or "onedrive.live.com" in u or "1drv.ms" in u or "-my.sharepoint.com" in u:
         return "onedrive"
     return "desconhecido"
 
-
-def converter_link_download(url: str) -> Tuple[str, str]:
+def converter_link_onedrive(url: str) -> str:
     if not url:
-        return url, "desconhecido"
-
+        return url
     url = url.strip()
-    plat = detect_plataforma(url)
-
-    if plat == "gsheets":
-        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
-        if not m:
-            return url, plat
-        file_id = m.group(1)
-        return f"https://docs.google.com/spreadsheets/d/{file_id}/export?format=xlsx", plat
-
-    if plat == "gdrive":
-        m = re.search(r"/file/d/([a-zA-Z0-9-_]+)", url)
-        if not m:
-            m = re.search(r"[?&]id=([a-zA-Z0-9-_]+)", url)
-        if not m:
-            return url, plat
-        file_id = m.group(1)
-        return f"https://drive.google.com/uc?export=download&id={file_id}", plat
-
-    if plat == "onedrive":
-        if "download=1" in url:
-            return url, plat
+    if "download=1" in url:
+        return url
+    if "sharepoint.com" in url and "/:x:/" in url:
+        base = url.split("?")[0]
+        return f"{base}?download=1"
+    if "1drv.ms" in url or "onedrive.live.com" in url:
         base = url.split("?")[0]
         if "?" in url:
-            return f"{url}&download=1", plat
-        return f"{base}?download=1", plat
+            return f"{base}&download=1"
+        return f"{base}?download=1"
+    if "?" in url:
+        return f"{url}&download=1"
+    return f"{url}?download=1"
 
-    return url, plat
-
-
-def validar_url(url: str) -> bool:
+def extrair_file_id_gdrive(url: str) -> Optional[str]:
     if not url:
-        return False
-    plat = detect_plataforma(url)
-    return plat in ["onedrive", "gsheets", "gdrive"]
+        return None
+    url = url.strip()
+    # formatos comuns:
+    # https://drive.google.com/file/d/<ID>/view?...
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    # https://drive.google.com/open?id=<ID>
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    # https://drive.google.com/uc?id=<ID>&export=download
+    m = re.search(r"/uc\?id=([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    return None
 
+def extrair_sheet_id_gsheets(url: str) -> Optional[str]:
+    if not url:
+        return None
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+def converter_link_gdrive_para_xlsx(url: str) -> str:
+    """
+    Converte:
+    - Google Sheets -> export xlsx
+    - Drive file -> export download
+    """
+    if not url:
+        return url
+    u = url.strip()
+    # Google Sheets
+    sid = extrair_sheet_id_gsheets(u)
+    if sid:
+        return f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx"
+    # Drive file
+    fid = extrair_file_id_gdrive(u)
+    if fid:
+        return f"https://drive.google.com/uc?id={fid}&export=download"
+    # fallback
+    return u
+
+def converter_link_para_download(url: str) -> Tuple[str, str]:
+    plat = detectar_plataforma_link(url)
+    if plat == "onedrive":
+        return converter_link_onedrive(url), "onedrive"
+    if plat == "gdrive":
+        return converter_link_gdrive_para_xlsx(url), "gdrive"
+    return (url or ""), "desconhecido"
+
+def validar_link(url: str) -> bool:
+    plat = detectar_plataforma_link(url)
+    return plat in ["onedrive", "gdrive"]
 
 # ==================== SUPABASE ====================
 @st.cache_resource
-def get_supabase():
+def init_connection():
     try:
         url = st.secrets.get("SUPABASE_URL", "")
         key = st.secrets.get("SUPABASE_KEY", "")
         if not url or not key:
+            st.error("⚠️ Secrets do Supabase não configurados (SUPABASE_URL e SUPABASE_KEY).")
             return None
         return create_client(url, key)
-    except Exception:
+    except Exception as e:
+        st.error(tradutor_erro(e))
         return None
 
+# ==================== CARGA DE DADOS (por botão) ====================
+@st.cache_data(ttl=Config.CACHE_TTL, show_spinner=False)
+def load_excel_base(url: str) -> Tuple[pd.DataFrame, bool, str, str, str]:
+    """
+    Retorna: df, ok, msg, plataforma, url_convertida
+    """
+    if not url or not url.strip():
+        return pd.DataFrame(), False, "Link vazio", "desconhecido", ""
 
-def supa_select_table(supabase, table: str) -> Tuple[bool, List[dict], str]:
+    if not validar_link(url):
+        return pd.DataFrame(), False, "Link inválido (use OneDrive/SharePoint ou Google Drive)", "desconhecido", ""
+
     try:
-        resp = supabase.table(table).select("*").execute()
-        return True, (resp.data or []), "OK"
-    except Exception as e:
-        return False, [], tradutor_erro(e)
+        url_download, plat = converter_link_para_download(url)
+        # Para evitar 401/403 redirecionamentos, usamos requests -> bytes -> pandas
+        r = requests.get(url_download, timeout=40)
+        if r.status_code in [401, 403]:
+            return pd.DataFrame(), False, "HTTP 401/403 (Unauthorized). Ajuste o compartilhamento para 'qualquer pessoa com link pode visualizar'.", plat, url_download
+        if r.status_code == 404:
+            return pd.DataFrame(), False, "HTTP 404 (Arquivo não encontrado).", plat, url_download
+        r.raise_for_status()
 
+        content = r.content
+        df = pd.read_excel(content, engine="openpyxl")
 
-def supa_upsert(supabase, table: str, row: dict, on_conflict: Optional[str] = None) -> Tuple[bool, str]:
-    try:
-        q = supabase.table(table).upsert(row, on_conflict=on_conflict) if on_conflict else supabase.table(table).upsert(row)
-        q.execute()
-        return True, "OK"
-    except Exception as e:
-        return False, tradutor_erro(e)
-
-
-def supa_insert(supabase, table: str, row: dict) -> Tuple[bool, str]:
-    try:
-        supabase.table(table).insert(row).execute()
-        return True, "OK"
-    except Exception as e:
-        return False, tradutor_erro(e)
-
-
-# ==================== CARGA DE BASES ====================
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def load_excel_from_url(url_download: str) -> Tuple[pd.DataFrame, bool, str]:
-    if not url_download:
-        return pd.DataFrame(), False, "Link vazio"
-    try:
-        df = pd.read_excel(url_download, engine="openpyxl")
         if df is None or df.empty:
-            return pd.DataFrame(), False, "Planilha vazia"
+            return pd.DataFrame(), False, "Planilha vazia ou sem dados válidos", plat, url_download
+
         df = df.dropna(how="all").dropna(axis=1, how="all")
         if df.empty:
-            return pd.DataFrame(), False, "Planilha sem dados válidos"
-        return df, True, "OK"
+            return pd.DataFrame(), False, "Planilha sem dados válidos após limpeza", plat, url_download
+
+        return df, True, "OK", plat, url_download
     except Exception as e:
-        return pd.DataFrame(), False, tradutor_erro(e)
+        return pd.DataFrame(), False, tradutor_erro(e), detectar_plataforma_link(url), ""
 
+def testar_link_tempo_real(url: str) -> Tuple[pd.DataFrame, bool, str, str, str]:
+    return load_excel_base.__wrapped__(url)
 
-def testar_link_tempo_real(url: str) -> Tuple[pd.DataFrame, bool, str, str]:
-    url2, plat = converter_link_download(url)
-    df, ok, msg = load_excel_from_url.__wrapped__(url2)
-    return df, ok, msg, plat
-
-
+@st.cache_data(ttl=Config.CACHE_TTL, show_spinner=False)
 def carregar_links(supabase) -> Dict[str, str]:
     if not supabase:
         return {}
-    ok, data, _ = supa_select_table(supabase, "config_links")
-    if not ok:
+    try:
+        r = supabase.table(Config.TBL_CONFIG_LINKS).select("*").execute()
+        return {i.get("base_nome"): i.get("url_link") for i in (r.data or [])}
+    except Exception:
         return {}
-    out = {}
-    for r in data:
-        bn = r.get("base_nome")
-        ul = r.get("url_link")
-        if bn:
-            out[str(bn)] = str(ul or "")
-    return out
 
-
+@st.cache_data(ttl=Config.CACHE_TTL, show_spinner=False)
 def carregar_parametros(supabase) -> Dict[str, float]:
-    defaults = DefaultParams()
-    base = {
-        "tributos": defaults.TRIBUTOS,
-        "devolucoes": defaults.DEVOLUCOES,
-        "comissao": defaults.COMISSAO,
-        "margem_alvo": defaults.MARGEM_ALVO,
-        "mod": defaults.MOD,
-        "bonificacao": defaults.BONIFICACAO,
-        "overhead": defaults.OVERHEAD,
-    }
+    """
+    Busca parâmetros em config_parametros.
+    Se vazio, aplica seed (default) e retorna.
+    """
+    params = {}
     if not supabase:
-        return base
-
-    ok, data, _ = supa_select_table(supabase, "config_parametros")
-    if not ok:
-        return base
-
-    for r in data:
-        nome = (r.get("nome_parametro") or "").strip().lower()
-        val = r.get("valor_percentual")
-        try:
-            if nome in base and val is not None:
-                base[nome] = float(val)
-        except Exception:
-            pass
-    return base
-
-
-def salvar_parametros(supabase, params: Dict[str, float]) -> Tuple[bool, str]:
-    if not supabase:
-        return False, "Sem conexão com Supabase"
-    for k, v in params.items():
-        ok, msg = supa_upsert(
-            supabase,
-            "config_parametros",
-            {"nome_parametro": k, "valor_percentual": float(v)},
-            on_conflict="nome_parametro",
-        )
-        if not ok:
-            return False, msg
+        return Config.DEFAULT_PARAMS.copy()
 
     try:
-        supa_insert(
-            supabase,
-            "config_parametros_log",
-            {
-                "datahora": datetime.now().isoformat(),
-                "usuario": st.session_state.get("email", ""),
-                "versao_app": __version__,
-                "payload": str(params),
-            },
-        )
+        r = supabase.table(Config.TBL_CONFIG_PARAM).select("*").execute()
+        data = r.data or []
+        for row in data:
+            nome = (row.get("nome_parametro") or "").strip().lower()
+            try:
+                params[nome] = float(row.get("valor_percentual"))
+            except Exception:
+                pass
+
+        if not params:
+            # seed (tabela vazia)
+            payload = []
+            for k, v in Config.DEFAULT_PARAMS.items():
+                payload.append({
+                    "nome_parametro": k,
+                    "valor_percentual": float(v),
+                    "grupo": Config.GROUP_CALC,
+                    "atualizado_em": datetime.now().isoformat()
+                })
+            supabase.table(Config.TBL_CONFIG_PARAM).upsert(payload).execute()
+            params = Config.DEFAULT_PARAMS.copy()
+
+        # garante chaves mínimas
+        for k, v in Config.DEFAULT_PARAMS.items():
+            if k not in params:
+                params[k] = v
+
+        return params
     except Exception:
-        pass
+        # fallback
+        return Config.DEFAULT_PARAMS.copy()
 
-    st.cache_data.clear()
-    return True, "OK"
+@st.cache_data(ttl=Config.CACHE_TTL, show_spinner=False)
+def carregar_margens_linha(supabase) -> Dict[str, float]:
+    """
+    Busca MC alvo por linha de produto.
+    Se tabela vazia, cria seed (AUDIO 40%, demais 30%).
+    """
+    if not supabase:
+        return {i["linha_produto"]: i["margem_alvo"] for i in Config.DEFAULT_MARGENS_LINHA}
 
-
-# ==================== DADOS DERIVADOS (PERFORMANCE) ====================
-@dataclass
-class BasesDerivadas:
-    precos: pd.DataFrame
-    inventario: pd.DataFrame
-    frete: pd.DataFrame
-    vpc: pd.DataFrame
-
-    produtos_dropdown: List[str]
-    prod_to_codpro: Dict[str, str]
-    codpro_to_desc: Dict[str, str]
-    clientes: List[str]
-    frete_pct_by_uf: Dict[str, float]
-    vpc_pct_by_cliente: Dict[str, float]
-    preco_atual_lookup: Dict[Tuple[str, str], Dict[str, float]]  # (cliente, codpro) -> {s_ipi, c_ipi, ipi_pct}
-    ipi_pct_by_codpro: Dict[str, float]
-
-
-def _safe_float(x) -> float:
     try:
-        if pd.isna(x):
-            return 0.0
-        return float(x)
+        r = supabase.table(Config.TBL_CONFIG_MARGENS).select("*").execute()
+        data = r.data or []
+        if not data:
+            supabase.table(Config.TBL_CONFIG_MARGENS).upsert([
+                {**x, "atualizado_em": datetime.now().isoformat()} for x in Config.DEFAULT_MARGENS_LINHA
+            ]).execute()
+            data = supabase.table(Config.TBL_CONFIG_MARGENS).select("*").execute().data or []
+
+        out = {}
+        for row in data:
+            linha = (row.get("linha_produto") or "").strip().upper()
+            try:
+                out[linha] = float(row.get("margem_alvo"))
+            except Exception:
+                pass
+
+        # fallback mínimo
+        if "AUDIO" not in out:
+            out["AUDIO"] = 0.40
+        return out
     except Exception:
-        return 0.0
-
-
-def _extract_codpro_from_prod(prod: str) -> str:
-    p = norm_txt(prod)
-    if not p:
-        return ""
-    if "-" in p:
-        return p.split("-", 1)[0].strip()
-    return p.split(" ", 1)[0].strip()
-
-
-def build_derivados(df_precos: pd.DataFrame, df_inv: pd.DataFrame, df_frete: pd.DataFrame, df_vpc: pd.DataFrame) -> BasesDerivadas:
-    col_prod = pick_col(df_precos, "PROD") or "PROD"
-    col_codpro = pick_col(df_precos, "SKU")
-    col_cliente = pick_col(df_precos, "CLIENTE")
-    col_qtd = pick_col(df_precos, "QTD_FAT")
-    col_p_s = pick_col(df_precos, "PRECO_S_IPI")
-    col_p_c = pick_col(df_precos, "PRECO_C_IPI")
-
-    produtos_dropdown: List[str] = []
-    prod_to_codpro: Dict[str, str] = {}
-    codpro_to_desc: Dict[str, str] = {}
-
-    if col_prod in df_precos.columns:
-        prods = df_precos[col_prod].dropna().astype(str).map(norm_txt).unique().tolist()
-        prods = [p for p in prods if p]
-        prods_sorted = sorted(prods)
-        produtos_dropdown = prods_sorted
-
-        for p in prods_sorted:
-            if col_codpro and col_codpro in df_precos.columns:
-                linha = df_precos[df_precos[col_prod].astype(str).map(norm_txt) == p]
-                if not linha.empty:
-                    cod = norm_txt(linha.iloc[0][col_codpro])
-                else:
-                    cod = _extract_codpro_from_prod(p)
-            else:
-                cod = _extract_codpro_from_prod(p)
-            prod_to_codpro[p] = cod
-
-            desc = p
-            if "-" in p:
-                desc = p.split("-", 1)[1].strip()
-            codpro_to_desc[cod] = desc
-
-    clientes: List[str] = ["(não informado)"]
-    if col_cliente and col_cliente in df_precos.columns:
-        clis = df_precos[col_cliente].dropna().astype(str).map(norm_txt).unique().tolist()
-        clis = [c for c in clis if c]
-        clientes += sorted(clis)
-
-    ipi_pct_by_codpro: Dict[str, float] = {}
-    if col_p_s and col_p_c and col_p_s in df_precos.columns and col_p_c in df_precos.columns:
-        tmp = df_precos.copy()
-        if col_codpro and col_codpro in tmp.columns:
-            tmp["_codpro"] = tmp[col_codpro].astype(str).map(norm_txt)
-        else:
-            tmp["_codpro"] = tmp[col_prod].astype(str).map(_extract_codpro_from_prod)
-
-        tmp["_ps"] = tmp[col_p_s].apply(_safe_float)
-        tmp["_pc"] = tmp[col_p_c].apply(_safe_float)
-
-        g = tmp.groupby("_codpro", dropna=True)
-        for cod, grp in g:
-            ps = grp["_ps"].replace(0, pd.NA).dropna()
-            pc = grp["_pc"].replace(0, pd.NA).dropna()
-            if ps.empty or pc.empty:
-                continue
-            ps_m = float(ps.mean())
-            pc_m = float(pc.mean())
-            if ps_m > 0:
-                ipi_pct_by_codpro[str(cod)] = max(0.0, (pc_m / ps_m) - 1.0)
-
-    preco_atual_lookup: Dict[Tuple[str, str], Dict[str, float]] = {}
-    if col_cliente and col_p_s and col_p_c and col_cliente in df_precos.columns and col_p_s in df_precos.columns and col_p_c in df_precos.columns:
-        tmp = df_precos.copy()
-        if col_codpro and col_codpro in tmp.columns:
-            tmp["_codpro"] = tmp[col_codpro].astype(str).map(norm_txt)
-        else:
-            tmp["_codpro"] = tmp[col_prod].astype(str).map(_extract_codpro_from_prod)
-
-        tmp["_cliente"] = tmp[col_cliente].astype(str).map(norm_txt)
-        tmp["_ps"] = tmp[col_p_s].apply(_safe_float)
-        tmp["_pc"] = tmp[col_p_c].apply(_safe_float)
-
-        if col_qtd and col_qtd in tmp.columns:
-            tmp["_qtd"] = tmp[col_qtd].apply(_safe_float)
-        else:
-            tmp["_qtd"] = 0.0
-
-        grp = tmp.groupby(["_cliente", "_codpro"], dropna=True)
-        for (cli, cod), g2 in grp:
-            ps = g2["_ps"]
-            pc = g2["_pc"]
-            qtd = g2["_qtd"]
-
-            if (qtd > 0).any():
-                wsum = float(qtd.sum())
-                if wsum > 0:
-                    ps_m = float((ps * qtd).sum() / wsum)
-                    pc_m = float((pc * qtd).sum() / wsum)
-                else:
-                    ps_m = float(ps.mean())
-                    pc_m = float(pc.mean())
-            else:
-                ps_m = float(ps.mean())
-                pc_m = float(pc.mean())
-
-            ipi_pct = 0.0
-            if ps_m > 0:
-                ipi_pct = max(0.0, (pc_m / ps_m) - 1.0)
-
-            preco_atual_lookup[(cli, cod)] = {"s_ipi": ps_m, "c_ipi": pc_m, "ipi_pct": ipi_pct}
-
-    # Inventário
-    col_inv_sku = pick_col(df_inv, "SKU")
-    col_inv_custo = pick_col(df_inv, "CUSTO") or "CUSTO"
-
-    inv = df_inv.copy()
-    if col_inv_sku and col_inv_sku in inv.columns:
-        inv["_codpro"] = inv[col_inv_sku].astype(str).map(norm_txt)
-    else:
-        col_inv_prod = pick_col(inv, "PROD")
-        if col_inv_prod and col_inv_prod in inv.columns:
-            inv["_codpro"] = inv[col_inv_prod].astype(str).map(_extract_codpro_from_prod)
-        else:
-            inv["_codpro"] = ""
-
-    if col_inv_custo in inv.columns:
-        inv["_custo"] = inv[col_inv_custo].apply(_safe_float)
-    else:
-        inv["_custo"] = 0.0
-
-    # Frete UF (%)
-    frete_pct_by_uf: Dict[str, float] = {}
-    col_f_uf = pick_col(df_frete, "UF") or "UF"
-    col_f_pct = pick_col(df_frete, "FRETE_PCT")
-
-    fr = df_frete.copy()
-    if col_f_uf in fr.columns:
-        fr["_uf"] = fr[col_f_uf].astype(str).map(norm_txt).str.upper()
-    else:
-        fr["_uf"] = ""
-    if col_f_pct and col_f_pct in fr.columns:
-        fr["_pct"] = fr[col_f_pct].apply(_safe_float)
-    else:
-        fr["_pct"] = 0.0
-
-    for _, r in fr.iterrows():
-        uf = r.get("_uf", "")
-        pct = float(r.get("_pct", 0.0))
-        if uf:
-            if pct > 1.0:
-                pct = pct / 100.0
-            frete_pct_by_uf[uf] = pct
-
-    # VPC por cliente
-    vpc_pct_by_cliente: Dict[str, float] = {}
-    v = df_vpc.copy()
-    col_v_cli = pick_col(v, "CLIENTE")
-    col_v_pct = pick_col(v, "VPC_PCT")
-    if col_v_cli and col_v_pct and col_v_cli in v.columns and col_v_pct in v.columns:
-        v["_cli"] = v[col_v_cli].astype(str).map(norm_txt)
-        v["_pct"] = v[col_v_pct].apply(_safe_float)
-        for _, r in v.iterrows():
-            cli = r.get("_cli", "")
-            pct = float(r.get("_pct", 0.0))
-            if pct > 1.0:
-                pct = pct / 100.0
-            if cli:
-                vpc_pct_by_cliente[cli] = pct
-
-    return BasesDerivadas(
-        precos=df_precos,
-        inventario=inv,
-        frete=fr,
-        vpc=v,
-        produtos_dropdown=produtos_dropdown,
-        prod_to_codpro=prod_to_codpro,
-        codpro_to_desc=codpro_to_desc,
-        clientes=clientes,
-        frete_pct_by_uf=frete_pct_by_uf,
-        vpc_pct_by_cliente=vpc_pct_by_cliente,
-        preco_atual_lookup=preco_atual_lookup,
-        ipi_pct_by_codpro=ipi_pct_by_codpro,
-    )
-
+        return {i["linha_produto"]: i["margem_alvo"] for i in Config.DEFAULT_MARGENS_LINHA}
 
 # ==================== AUTENTICAÇÃO ====================
-def autenticar_usuario(supabase, email: str, senha: str) -> Tuple[bool, Optional[Dict]]:
-    if not supabase:
-        return False, None
-    email = (email or "").strip().lower()
-    senha = senha or ""
-    try:
-        resp = supabase.table("usuarios").select("*").eq("email", email).execute()
-        if not resp.data:
-            return False, None
-
-        u = resp.data[0]
-        stored = str(u.get("senha", "") or "")
-        entered_hash = sha256_hex(senha)
-
-        ok = False
-        if re.fullmatch(r"[0-9a-fA-F]{64}", stored):
-            ok = stored.lower() == entered_hash.lower()
-        else:
-            ok = stored == senha
-
-        if not ok:
-            return False, None
-
-        perfil = u.get("perfil", "Vendedor") or "Vendedor"
-        nome = u.get("nome", "Usuário") or "Usuário"
-        return True, {"email": email, "perfil": str(perfil), "nome": str(nome)}
-    except Exception:
-        return False, None
-
-
-# ==================== MOTOR (Política v3) ====================
-@dataclass
-class ResultadoCalc:
-    preco_sem_ipi: float
-    preco_com_ipi: float
-    receita_liquida: float
-    lucro_bruto: float
-    mc_pct: float
-    overhead_rs: float
-    ebitda_rs: float
-    ebitda_pct: float
-
-    # Governança
-    custo_total: float
-    total_cv_pct: float
-    tributos_rs: float
-    devolucoes_rs: float
-    vpc_rs: float
-    comissao_rs: float
-    frete_rs: float
-    ipi_pct: float
-
-
-def calcular_precificacao_v3(
-    cpv: float,
-    ipi_pct: float,
-    frete_pct: float,
-    vpc_pct: float,
-    params: Dict[str, float],
-) -> Tuple[Optional[ResultadoCalc], str]:
-    try:
-        cpv = float(cpv)
-        if cpv <= 0:
-            return None, "CPV inválido (<= 0)."
-
-        mod = float(params.get("mod", DefaultParams.MOD))
-        bon = float(params.get("bonificacao", DefaultParams.BONIFICACAO))
-        trib = float(params.get("tributos", DefaultParams.TRIBUTOS))
-        dev = float(params.get("devolucoes", DefaultParams.DEVOLUCOES))
-        com = float(params.get("comissao", DefaultParams.COMISSAO))
-        marg = float(params.get("margem_alvo", DefaultParams.MARGEM_ALVO))
-        over = float(params.get("overhead", DefaultParams.OVERHEAD))
-
-        ipi_pct = max(0.0, float(ipi_pct))
-        frete_pct = max(0.0, float(frete_pct))
-        vpc_pct = max(0.0, float(vpc_pct))
-
-        custo_total = cpv * (1.0 + mod + bon)
-
-        total_cv = trib + dev + com + frete_pct + marg + vpc_pct
-        if total_cv >= 1.0:
-            return None, "Erro matemático: Total_CV_% >= 100% (ajuste parâmetros)."
-
-        preco_sem_ipi = custo_total / (1.0 - total_cv)
-        preco_com_ipi = preco_sem_ipi * (1.0 + ipi_pct)
-
-        trib_rs = preco_com_ipi * trib
-        dev_rs = preco_com_ipi * dev
-        vpc_rs = preco_com_ipi * vpc_pct
-
-        receita_liq = preco_com_ipi - trib_rs - dev_rs - vpc_rs
-        if receita_liq <= 0:
-            return None, "Receita Líquida <= 0 (verifique parâmetros)."
-
-        com_rs = preco_com_ipi * com
-        frete_rs = preco_com_ipi * frete_pct
-
-        lucro_bruto = receita_liq - custo_total - com_rs - frete_rs
-        mc_pct = lucro_bruto / receita_liq if receita_liq != 0 else 0.0
-
-        overhead_rs = preco_com_ipi * over  # Política v3: base Receita Bruta (Preço COM IPI)
-        ebitda_rs = lucro_bruto - overhead_rs
-        ebitda_pct = ebitda_rs / receita_liq if receita_liq != 0 else 0.0
-
-        return (
-            ResultadoCalc(
-                preco_sem_ipi=preco_sem_ipi,
-                preco_com_ipi=preco_com_ipi,
-                receita_liquida=receita_liq,
-                lucro_bruto=lucro_bruto,
-                mc_pct=mc_pct,
-                overhead_rs=overhead_rs,
-                ebitda_rs=ebitda_rs,
-                ebitda_pct=ebitda_pct,
-                custo_total=custo_total,
-                total_cv_pct=total_cv,
-                tributos_rs=trib_rs,
-                devolucoes_rs=dev_rs,
-                vpc_rs=vpc_rs,
-                comissao_rs=com_rs,
-                frete_rs=frete_rs,
-                ipi_pct=ipi_pct,
-            ),
-            "OK",
-        )
-    except Exception as e:
-        return None, tradutor_erro(e)
-
-
-# ==================== SESSION ====================
-def init_session():
+def inicializar_sessao():
     defaults = {
         "autenticado": False,
         "perfil": "Vendedor",
         "email": "",
         "nome": "Usuário",
-        "bases_status": {},
-        "bases_derivadas": None,
-        "last_consulta": {
-            "produto_prod": "",
-            "uf": "SP",
-            "cliente": "(não informado)",
-            "usar_cliente": False,
-            "aplicar_vpc": False,
-        },
+        "last_query": {},        # guarda última consulta
+        "bases_cache": None,     # cache em sessão (dataframes)
+        "bases_status": None
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
+def autenticar_usuario(supabase, email: str, senha: str) -> Tuple[bool, Optional[Dict]]:
+    if not supabase:
+        return False, None
+    try:
+        # compat: se sua tabela armazena senha em texto, mantém eq("senha", senha).
+        # se armazena hash, substitua por hash_password(senha).
+        r = supabase.table(Config.TBL_USUARIOS).select("*").eq("email", email).eq("senha", senha).execute()
+        if r.data:
+            u = r.data[0]
+            perfil = u.get("perfil", "Vendedor")
+            # troca "Master" -> "ADM" se vier assim
+            if str(perfil).strip().lower() == "master":
+                perfil = "ADM"
+            return True, {
+                "email": u.get("email"),
+                "perfil": perfil,
+                "nome": u.get("nome", "Usuário")
+            }
+        return False, None
+    except Exception as e:
+        st.error(tradutor_erro(e))
+        return False, None
 
-# ==================== TELAS (helpers) ====================
+# ==================== INDEXAÇÃO / PERFORMANCE ====================
+def preparar_indices(df_precos: pd.DataFrame, df_inv: pd.DataFrame, df_frete: pd.DataFrame, df_vpc: pd.DataFrame) -> Dict:
+    """
+    Pré-calcula colunas e dicionários para acelerar consultas.
+    """
+    idx = {}
+
+    # preços atuais
+    idx["precos_prod"] = find_col(df_precos, DEPARA_COLS["PROD_DESC"])
+    idx["precos_codpro"] = find_col(df_precos, DEPARA_COLS["SKU"])
+    idx["precos_cliente"] = find_col(df_precos, DEPARA_COLS["CLIENTE"])
+    idx["precos_qtd"] = find_col(df_precos, DEPARA_COLS["QTD_FAT"])
+    idx["precos_nf"] = find_col(df_precos, DEPARA_COLS["NUM_NF"])
+    idx["precos_data"] = find_col(df_precos, DEPARA_COLS["DATA"])
+    idx["precos_s_ipi"] = find_col(df_precos, DEPARA_COLS["PRECO_ATUAL_S_IPI"])
+    idx["precos_c_ipi"] = find_col(df_precos, DEPARA_COLS["PRECO_ATUAL_C_IPI"])
+    idx["precos_cmv"] = find_col(df_precos, DEPARA_COLS["CMV"])
+
+    # inventário
+    idx["inv_sku"] = find_col(df_inv, DEPARA_COLS["SKU"])
+    idx["inv_custo"] = find_col(df_inv, ["CUSTO"]) or find_col(df_inv, DEPARA_COLS["CUSTO"])
+
+    # frete
+    idx["frete_uf"] = find_col(df_frete, DEPARA_COLS["UF"])
+    idx["frete_perc"] = find_col(df_frete, DEPARA_COLS["FRETE_PERC"])
+
+    # vpc
+    idx["vpc_cliente"] = find_col(df_vpc, DEPARA_COLS["CLIENTE"])
+    idx["vpc_perc"] = find_col(df_vpc, DEPARA_COLS["VPC_PERC"])
+
+    # lista produtos para busca (preferir PROD para descrição)
+    if idx["precos_prod"]:
+        produtos = df_precos[idx["precos_prod"]].dropna().astype(str).map(limpar_texto).unique().tolist()
+        produtos = sorted([p for p in produtos if p])
+    else:
+        produtos = []
+
+    # clientes
+    if idx["precos_cliente"]:
+        clientes = df_precos[idx["precos_cliente"]].dropna().astype(str).map(limpar_texto).unique().tolist()
+        clientes = sorted([c for c in clientes if c])
+    else:
+        clientes = []
+
+    idx["lista_produtos"] = produtos
+    idx["lista_clientes"] = clientes
+
+    return idx
+
+def parse_codpro_from_prod(prod: str) -> str:
+    """
+    PROD costuma vir "CODIGO-Descrição". Extraímos a parte antes do primeiro "-".
+    Se não houver, tenta pegar primeiros dígitos.
+    """
+    p = limpar_texto(prod)
+    if "-" in p:
+        return limpar_texto(p.split("-", 1)[0])
+    m = re.match(r"^(\d+)", p)
+    return m.group(1) if m else p
+
+def to_float(x) -> float:
+    try:
+        if pd.isna(x):
+            return 0.0
+        if isinstance(x, str):
+            x = x.strip().replace(".", "").replace(",", ".")
+        return float(x)
+    except Exception:
+        return 0.0
+
+# ==================== REGRA DE NEGÓCIO (POLÍTICA v3) ====================
+def calcular_precificacao_v3(
+    cpv: float,
+    ipi_perc: float,
+    frete_perc: float,
+    vpc_perc: float,
+    margem_alvo: float,
+    params: Dict[str, float]
+) -> Tuple[Dict, Dict]:
+    """
+    Política v3:
+    - Receita Base COM IPI (IPI integra Receita Bruta)
+    - Overhead sobre Preço Bruto COM IPI
+    - Bonificação e MOD base custo (no custo total)
+    - Gross-up: tributos + devoluções + comissão + frete + margem alvo + vpc_cond
+    """
+    audit = {}
+
+    trib = float(params.get(Config.PARAM_TRIBUTOS, 0.15))
+    dev = float(params.get(Config.PARAM_DEVOLUCOES, 0.03))
+    com = float(params.get(Config.PARAM_COMISSAO, 0.03))
+    mod = float(params.get(Config.PARAM_MOD, 0.01))
+    bon = float(params.get(Config.PARAM_BONIFICACAO, 0.01))
+    oh = float(params.get(Config.PARAM_OVERHEAD, 0.16))
+
+    cpv = float(cpv or 0.0)
+    ipi = float(ipi_perc or 0.0)
+    frete = float(frete_perc or 0.0)
+    vpc = float(vpc_perc or 0.0)
+    margem = float(margem_alvo or 0.0)
+
+    # 3.1 Custo total
+    custo_total = cpv * (1 + mod + bon)
+
+    # 4 Total CV %
+    total_cv = trib + dev + com + frete + margem + vpc
+    if total_cv >= 1:
+        raise ValueError(f"Total_CV_% >= 100% (atual: {total_cv*100:.2f}%). Ajuste parâmetros.")
+
+    # 5 Preços
+    preco_sem_ipi = custo_total / (1 - total_cv)
+    preco_com_ipi = preco_sem_ipi * (1 + ipi)
+
+    # 6 Receita líquida (critério v3)
+    trib_r = preco_com_ipi * trib
+    dev_r = preco_com_ipi * dev
+    vpc_r = preco_com_ipi * vpc
+    receita_liq = preco_com_ipi - trib_r - dev_r - vpc_r
+
+    # 7 resultado operacional
+    com_r = preco_com_ipi * com
+    frete_r = preco_com_ipi * frete
+    lucro_bruto = receita_liq - custo_total - com_r - frete_r
+
+    mc_pct = (lucro_bruto / receita_liq) if receita_liq > 0 else 0.0
+
+    # 8 EBITDA
+    overhead_r = preco_com_ipi * oh
+    ebitda_r = lucro_bruto - overhead_r
+    ebitda_pct = (ebitda_r / receita_liq) if receita_liq > 0 else 0.0
+
+    out = {
+        "Preco_Sem_IPI": preco_sem_ipi,
+        "Preco_Com_IPI": preco_com_ipi,
+        "Receita_Liquida": receita_liq,
+        "Lucro_Bruto": lucro_bruto,
+        "MC_pct": mc_pct,
+        "Overhead_R": overhead_r,
+        "EBITDA_R": ebitda_r,
+        "EBITDA_pct": ebitda_pct,
+        "Total_CV": total_cv,
+        "Custo_Total": custo_total,
+    }
+
+    # Auditoria explícita linha a linha
+    audit = {
+        "CPV": cpv,
+        "MOD_%": mod,
+        "Bonificacao_%": bon,
+        "Custo_Total = CPV*(1+MOD+Bonif)": custo_total,
+        "Tributos_%": trib,
+        "Devolucoes_%": dev,
+        "Comissao_%": com,
+        "Frete_UF_%": frete,
+        "Margem_Alvo_%": margem,
+        "VPC_%": vpc,
+        "Total_CV_% (gross-up)": total_cv,
+        "Preço Sem IPI": preco_sem_ipi,
+        "IPI_%": ipi,
+        "Preço Com IPI": preco_com_ipi,
+        "Tributos_R$": trib_r,
+        "Devolucoes_R$": dev_r,
+        "VPC_R$": vpc_r,
+        "Receita_Liquida": receita_liq,
+        "Comissao_R$": com_r,
+        "Frete_R$": frete_r,
+        "Lucro_Bruto (MC R$)": lucro_bruto,
+        "MC_%": mc_pct,
+        "Overhead_% (sobre Preço c/ IPI)": oh,
+        "Overhead_R$": overhead_r,
+        "EBITDA_R$": ebitda_r,
+        "EBITDA_%": ebitda_pct,
+    }
+
+    return out, audit
+
+# ==================== REGRAS DE EXTRAÇÃO (CPV / IPI / PREÇO ATUAL / FRETE / VPC) ====================
+def obter_cpv(
+    codpro: str,
+    df_inv: pd.DataFrame,
+    df_precos: pd.DataFrame,
+    idx: Dict
+) -> Tuple[float, str]:
+    """
+    CPV:
+    1) Tenta Inventário (coluna CUSTO)
+    2) Fallback obrigatório: CPV = ABS(CMV)/ABS(QTD_FAT) na base Preços Atuais
+       Se várias linhas: pega a linha com maior NF (se existir) ou maior DATA (se existir)
+    """
+    codpro = limpar_texto(codpro)
+
+    # 1) Inventário
+    col_sku = idx.get("inv_sku")
+    col_custo = idx.get("inv_custo")
+    if col_sku and col_custo and (df_inv is not None) and (not df_inv.empty):
+        subset = df_inv[df_inv[col_sku].astype(str).str.strip() == codpro]
+        if not subset.empty:
+            v = to_float(subset.iloc[0][col_custo])
+            if v > 0:
+                return v, "Inventário (CUSTO)"
+
+    # 2) Fallback: CMV/QTD_FAT em Preços Atuais
+    col_codpro = idx.get("precos_codpro")
+    col_cmv = idx.get("precos_cmv")
+    col_qtd = idx.get("precos_qtd")
+    if col_codpro and col_cmv and col_qtd and (df_precos is not None) and (not df_precos.empty):
+        subset = df_precos[df_precos[col_codpro].astype(str).str.strip() == codpro].copy()
+        if not subset.empty:
+            # ordenação por NF e/ou DATA (desc)
+            col_nf = idx.get("precos_nf")
+            col_dt = idx.get("precos_data")
+
+            def safe_int(x):
+                try:
+                    return int(float(str(x).strip().replace(".", "").replace(",", ".")))
+                except Exception:
+                    return 0
+
+            if col_nf and col_nf in subset.columns:
+                subset["_nf_"] = subset[col_nf].apply(safe_int)
+                subset = subset.sort_values("_nf_", ascending=False)
+            elif col_dt and col_dt in subset.columns:
+                subset["_dt_"] = pd.to_datetime(subset[col_dt], errors="coerce")
+                subset = subset.sort_values("_dt_", ascending=False)
+
+            row = subset.iloc[0]
+            cmv = abs(to_float(row[col_cmv]))
+            qtd = abs(to_float(row[col_qtd]))
+            if qtd > 0 and cmv > 0:
+                return cmv / qtd, "Fallback (ABS(CMV)/ABS(QTD_FAT)) - Preços Atuais (linha mais recente)"
+
+    return 0.0, "Não encontrado"
+
+def obter_preco_atual_e_ipi(
+    codpro: str,
+    cliente: Optional[str],
+    df_precos: pd.DataFrame,
+    idx: Dict
+) -> Tuple[float, float, float]:
+    """
+    Retorna:
+    - preço atual s/ ipi (médio)
+    - preço atual c/ ipi (médio)
+    - ipi% derivado (se possível), senão 0
+    Preferência: média ponderada por QTD_FAT (se existir)
+    """
+    codpro = limpar_texto(codpro)
+    if df_precos is None or df_precos.empty:
+        return 0.0, 0.0, 0.0
+
+    col_codpro = idx.get("precos_codpro")
+    col_cli = idx.get("precos_cliente")
+    col_qtd = idx.get("precos_qtd")
+    col_s = idx.get("precos_s_ipi")
+    col_c = idx.get("precos_c_ipi")
+
+    if not col_codpro or not col_s or not col_c:
+        return 0.0, 0.0, 0.0
+
+    subset = df_precos[df_precos[col_codpro].astype(str).str.strip() == codpro].copy()
+    if cliente and col_cli:
+        subset = subset[subset[col_cli].astype(str).str.strip() == str(cliente).strip()]
+
+    if subset.empty:
+        return 0.0, 0.0, 0.0
+
+    subset["_s_"] = subset[col_s].apply(to_float)
+    subset["_c_"] = subset[col_c].apply(to_float)
+
+    if col_qtd and col_qtd in subset.columns:
+        subset["_q_"] = subset[col_qtd].apply(lambda x: max(to_float(x), 0.0))
+        qsum = subset["_q_"].sum()
+        if qsum > 0:
+            ps = (subset["_s_"] * subset["_q_"]).sum() / qsum
+            pc = (subset["_c_"] * subset["_q_"]).sum() / qsum
+        else:
+            ps = float(subset["_s_"].mean())
+            pc = float(subset["_c_"].mean())
+    else:
+        ps = float(subset["_s_"].mean())
+        pc = float(subset["_c_"].mean())
+
+    ipi = (pc / ps - 1) if ps > 0 and pc > 0 else 0.0
+    ipi = max(ipi, 0.0)
+
+    return ps, pc, ipi
+
+def obter_frete_perc(uf: str, df_frete: pd.DataFrame, idx: Dict) -> float:
+    """
+    Frete UF em percentual (ex.: 0.0291 = 2,91%).
+    """
+    uf = (uf or "").strip().upper()
+    if df_frete is None or df_frete.empty:
+        return 0.0
+
+    col_uf = idx.get("frete_uf")
+    col_p = idx.get("frete_perc")
+    if not col_uf or not col_p:
+        return 0.0
+
+    sub = df_frete[df_frete[col_uf].astype(str).str.strip().str.upper() == uf]
+    if sub.empty:
+        return 0.0
+
+    v = to_float(sub.iloc[0][col_p])
+    # se vier como "2,91" (percentual inteiro), normaliza
+    if v > 1:
+        v = v / 100.0
+    return max(v, 0.0)
+
+def obter_vpc_perc(cliente: str, df_vpc: pd.DataFrame, idx: Dict) -> float:
+    if not cliente:
+        return 0.0
+    if df_vpc is None or df_vpc.empty:
+        return 0.0
+
+    col_c = idx.get("vpc_cliente")
+    col_p = idx.get("vpc_perc")
+    if not col_c or not col_p:
+        return 0.0
+
+    sub = df_vpc[df_vpc[col_c].astype(str).str.strip() == str(cliente).strip()]
+    if sub.empty:
+        return 0.0
+
+    v = to_float(sub.iloc[0][col_p])
+    if v > 1:
+        v = v / 100.0
+    return max(v, 0.0)
+
+def detectar_linha_produto(prod_desc: str) -> str:
+    """
+    Heurística simples:
+    - tenta encontrar palavras-chave no texto do produto
+    Ajuste conforme seu padrão interno, ou alimente via base no futuro.
+    """
+    t = (prod_desc or "").upper()
+    if "AUDIO" in t or "CAIXA" in t or "SOUNDBAR" in t or "AMPLIF" in t:
+        return "AUDIO"
+    if "AR" in t or "CLIMA" in t or "VENT" in t:
+        return "CLIMA"
+    if "TV" in t or "VIDEO" in t:
+        return "VIDEO"
+    if "NOTE" in t or "PC" in t or "INFORMAT" in t:
+        return "INFORMATICA"
+    return "LAR"
+
+# ==================== LOGS ====================
+def registrar_log(supabase, payload: Dict):
+    if not supabase:
+        return
+    try:
+        supabase.table(Config.TBL_LOGS).insert(payload).execute()
+    except Exception:
+        # sem bloquear a operação
+        pass
+
+# ==================== TELAS ====================
 def tela_login(supabase):
     st.title("🔐 Login - Pricing Corporativo")
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
         with st.form("login_form"):
             st.markdown("### Acesse sua conta")
             email = st.text_input("📧 E-mail", placeholder="seu.email@empresa.com")
             senha = st.text_input("🔑 Senha", type="password")
-            btn = st.form_submit_button("Entrar", use_container_width=True)
-            if btn:
+            entrar = st.form_submit_button("Entrar", use_container_width=True)
+            if entrar:
+                if not email or not senha:
+                    st.error("⚠️ Preencha e-mail e senha.")
+                    return
                 ok, dados = autenticar_usuario(supabase, email, senha)
-                if ok and dados:
-                    st.session_state.update(
-                        {
-                            "autenticado": True,
-                            "perfil": dados["perfil"],
-                            "email": dados["email"],
-                            "nome": dados["nome"],
-                        }
-                    )
-                    st.success("✅ Login realizado!")
+                if ok:
+                    st.session_state.update({
+                        "autenticado": True,
+                        "perfil": dados["perfil"],
+                        "email": dados["email"],
+                        "nome": dados["nome"]
+                    })
+                    st.success("✅ Login realizado.")
                     st.rerun()
                 else:
-                    st.error("❌ E-mail ou senha incorretos")
+                    st.error("❌ E-mail ou senha incorretos.")
 
+def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float], margens: Dict[str, float]):
+    st.title("⚙️ Configurações (ADM/Master)")
 
-def status_bases_ui(status: Dict[str, Tuple[bool, str]]):
-    falhas = [n for n, (ok, _) in status.items() if not ok]
+    if not is_admin(st.session_state.get("perfil", "")):
+        st.warning("⚠️ Acesso restrito a usuários ADM/Master.")
+        return
+
+    tab1, tab2, tab3 = st.tabs(["🔗 Links das Bases", "🧮 Parâmetros do Cálculo", "🎯 Margem Alvo por Linha"])
+
+    # -------- Links --------
+    with tab1:
+        st.info("Cole links do **OneDrive/SharePoint** ou **Google Drive (Sheets)**. O sistema converte para download automaticamente.")
+        bases = ["Preços Atuais", "Inventário", "Frete UF", "VPC por cliente"]
+
+        for base in bases:
+            url_salva = links.get(base, "")
+            with st.expander(f"📌 {base}", expanded=True):
+                novo = st.text_area(
+                    "Link da planilha",
+                    value=url_salva,
+                    height=90,
+                    key=f"link_{base}",
+                    placeholder="Cole aqui o link (OneDrive/SharePoint ou Google Drive)",
+                )
+                if novo and novo.strip():
+                    novo_limpo = novo.strip()
+                    url_conv, plat = converter_link_para_download(novo_limpo)
+                    st.caption(f"Plataforma detectada: **{plat}**")
+                    st.caption(f"Link convertido (download): {url_conv}")
+
+                    colA, colB = st.columns([1, 1])
+                    with colA:
+                        if st.button("🧪 Validar link", key=f"validar_{base}", use_container_width=True):
+                            with st.spinner("Testando..."):
+                                df_t, ok, msg, plat2, conv2 = testar_link_tempo_real(novo_limpo)
+                            if ok:
+                                st.success("✅ Link OK.")
+                                st.write(f"Linhas: {len(df_t)} | Colunas: {len(df_t.columns)}")
+                                st.code(", ".join(df_t.columns.astype(str).tolist()))
+                                st.dataframe(df_t.head(5), use_container_width=True)
+                            else:
+                                st.error(f"❌ Falha: {msg}")
+
+                    with colB:
+                        if st.button("💾 Salvar", key=f"salvar_{base}", type="primary", use_container_width=True):
+                            try:
+                                supabase.table(Config.TBL_CONFIG_LINKS).upsert({
+                                    "base_nome": base,
+                                    "url_link": novo_limpo,
+                                    "atualizado_em": datetime.now().isoformat()
+                                }).execute()
+                                st.success("✅ Salvo.")
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Erro ao salvar: {tradutor_erro(e)}")
+                else:
+                    st.warning("⚠️ Sem link configurado.")
+
+    # -------- Parâmetros --------
+    with tab2:
+        st.info("Valores em percentual decimal (ex.: 0,15 = 15%). Ajuste apenas se houver mudança de política.")
+        col1, col2 = st.columns(2)
+
+        def nump(label, key, default):
+            return st.number_input(label, min_value=0.0, max_value=0.9999, step=0.0001, value=float(default), format="%.4f", key=key)
+
+        with col1:
+            trib = nump("Tributos (ex.: 0,15)", "p_trib", params.get(Config.PARAM_TRIBUTOS, 0.15))
+            dev = nump("Devoluções (ex.: 0,03)", "p_dev", params.get(Config.PARAM_DEVOLUCOES, 0.03))
+            com = nump("Comissão (ex.: 0,03)", "p_com", params.get(Config.PARAM_COMISSAO, 0.03))
+        with col2:
+            mod = nump("MOD (base custo) (ex.: 0,01)", "p_mod", params.get(Config.PARAM_MOD, 0.01))
+            bon = nump("Bonificação (base custo) (ex.: 0,01)", "p_bon", params.get(Config.PARAM_BONIFICACAO, 0.01))
+            oh = nump("Overhead (sobre Preço c/ IPI) (ex.: 0,16)", "p_oh", params.get(Config.PARAM_OVERHEAD, 0.16))
+
+        if st.button("💾 Salvar parâmetros", type="primary"):
+            try:
+                payload = [
+                    {"nome_parametro": Config.PARAM_TRIBUTOS, "valor_percentual": trib, "grupo": Config.GROUP_CALC, "atualizado_em": datetime.now().isoformat()},
+                    {"nome_parametro": Config.PARAM_DEVOLUCOES, "valor_percentual": dev, "grupo": Config.GROUP_CALC, "atualizado_em": datetime.now().isoformat()},
+                    {"nome_parametro": Config.PARAM_COMISSAO, "valor_percentual": com, "grupo": Config.GROUP_CALC, "atualizado_em": datetime.now().isoformat()},
+                    {"nome_parametro": Config.PARAM_MOD, "valor_percentual": mod, "grupo": Config.GROUP_CALC, "atualizado_em": datetime.now().isoformat()},
+                    {"nome_parametro": Config.PARAM_BONIFICACAO, "valor_percentual": bon, "grupo": Config.GROUP_CALC, "atualizado_em": datetime.now().isoformat()},
+                    {"nome_parametro": Config.PARAM_OVERHEAD, "valor_percentual": oh, "grupo": Config.GROUP_CALC, "atualizado_em": datetime.now().isoformat()},
+                ]
+                supabase.table(Config.TBL_CONFIG_PARAM).upsert(payload).execute()
+                st.success("✅ Parâmetros atualizados.")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Falha ao salvar: {tradutor_erro(e)}")
+
+    # -------- Margens por linha --------
+    with tab3:
+        st.info("A MC Alvo é por linha. Valores iniciais: AUDIO 40%, demais 30%. Ajustável.")
+        linhas = sorted(list(set(list(margens.keys()) + ["AUDIO", "LAR", "INFORMATICA", "CLIMA", "VIDEO"])))
+        edited = {}
+        for ln in linhas:
+            edited[ln] = st.number_input(f"{ln}", min_value=0.0, max_value=0.9999, step=0.0001, value=float(margens.get(ln, 0.30)), format="%.4f", key=f"m_{ln}")
+
+        if st.button("💾 Salvar margens por linha", type="primary"):
+            try:
+                payload = [{"linha_produto": ln, "margem_alvo": float(val), "atualizado_em": datetime.now().isoformat()} for ln, val in edited.items()]
+                supabase.table(Config.TBL_CONFIG_MARGENS).upsert(payload).execute()
+                st.success("✅ Margens atualizadas.")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Falha ao salvar: {tradutor_erro(e)}")
+
+def mostrar_status_bases(status: Dict[str, Tuple[bool, str]]):
+    falhas = [k for k, (ok, _) in status.items() if not ok]
     with st.expander("📌 Status das Bases", expanded=bool(falhas)):
         cols = st.columns(2)
-        for i, (nome, (ok, msg)) in enumerate(status.items()):
+        i = 0
+        for nome, (ok, msg) in status.items():
             with cols[i % 2]:
                 if ok:
                     st.success(f"✅ {nome}")
                 else:
                     st.error(f"❌ {nome}")
                     st.caption(msg)
+            i += 1
     return falhas
 
-
-def carregar_bases_on_demand(links: Dict[str, str]) -> Tuple[Optional[BasesDerivadas], Dict[str, Tuple[bool, str]]]:
-    status: Dict[str, Tuple[bool, str]] = {}
-    dfs: Dict[str, pd.DataFrame] = {}
-
-    for base in BASES_NOMES:
-        url = links.get(base, "")
-        if not url:
-            status[base] = (False, "Link vazio")
-            dfs[base] = pd.DataFrame()
-            continue
-
-        if not validar_url(url):
-            status[base] = (False, "Link inválido (use OneDrive/SharePoint ou Google Drive/Sheets)")
-            dfs[base] = pd.DataFrame()
-            continue
-
-        url_download, plat = converter_link_download(url)
-        df, ok, msg = load_excel_from_url(url_download)
-        if ok:
-            status[base] = (True, f"OK ({plat})")
-            dfs[base] = df
-        else:
-            status[base] = (False, msg)
-            dfs[base] = pd.DataFrame()
-
-    falhas = [n for n, (ok, _) in status.items() if not ok]
-    if falhas:
-        return None, status
-
-    derivados = build_derivados(
-        dfs.get("Preços Atuais", pd.DataFrame()),
-        dfs.get("Inventário", pd.DataFrame()),
-        dfs.get("Frete UF", pd.DataFrame()),
-        dfs.get("VPC por cliente", pd.DataFrame()),
-    )
-    return derivados, status
-
-
-def obter_cpv(der: BasesDerivadas, codpro: str) -> Tuple[float, str]:
+def carregar_bases_por_botao(links: Dict[str, str]):
     """
-    Regra:
-    1) Tenta Inventário (coluna CUSTO)
-    2) Fallback obrigatório: CPV = ABS(CMV) / ABS(QTD_FAT) na base Preços Atuais
-       - Se houver múltiplas linhas: prioriza maior Nº Nota; se não existir, data mais recente; senão primeira linha válida
+    Carrega e armazena em sessão (evita lentidão)
     """
-    inv = der.inventario
-    if inv is not None and not inv.empty:
-        linha = inv[inv["_codpro"] == codpro]
-        if not linha.empty:
-            cpv = float(linha.iloc[0].get("_custo", 0.0))
-            if cpv > 0:
-                return cpv, "Inventário (CUSTO)"
+    with st.spinner("Carregando bases..."):
+        df_precos, ok1, msg1, _, _ = load_excel_base(links.get("Preços Atuais", ""))
+        df_inv, ok2, msg2, _, _ = load_excel_base(links.get("Inventário", ""))
+        df_frete, ok3, msg3, _, _ = load_excel_base(links.get("Frete UF", ""))
+        df_vpc, ok4, msg4, _, _ = load_excel_base(links.get("VPC por cliente", ""))
 
-    df = der.precos
-    col_codpro = pick_col(df, "SKU")
-    col_prod = pick_col(df, "PROD")
-    col_cmv = pick_col(df, "CMV")
-    col_qtd = pick_col(df, "QTD_FAT")
-    col_nota = pick_col(df, "NOTA")
-    col_data = pick_col(df, "DATA")
-
-    if df is None or df.empty or not col_cmv or not col_qtd:
-        return 0.0, "Não encontrado (sem base/fallback)"
-
-    tmp = df.copy()
-    if col_codpro and col_codpro in tmp.columns:
-        tmp["_codpro"] = tmp[col_codpro].astype(str).map(norm_txt)
-    elif col_prod and col_prod in tmp.columns:
-        tmp["_codpro"] = tmp[col_prod].astype(str).map(lambda x: _extract_codpro_from_prod(str(x)))
-    else:
-        tmp["_codpro"] = ""
-
-    tmp = tmp[tmp["_codpro"] == codpro]
-    if tmp.empty:
-        return 0.0, "Não encontrado (fallback sem linhas)"
-
-    # ABS(CMV)/ABS(QTD_FAT)
-    tmp["_cmv"] = tmp[col_cmv].apply(_safe_float).abs()
-    tmp["_qtd"] = tmp[col_qtd].apply(_safe_float).abs()
-    tmp = tmp[tmp["_qtd"] > 0]
-    if tmp.empty:
-        return 0.0, "Fallback inválido (QTD_FAT <= 0)"
-
-    # Prioridade 1: maior Nº Nota
-    if col_nota and col_nota in tmp.columns:
-        tmp["_nota_num"] = pd.to_numeric(tmp[col_nota], errors="coerce").fillna(0)
-        tmp = tmp.sort_values(by="_nota_num", ascending=False)
-    # Prioridade 2: data mais recente
-    elif col_data and col_data in tmp.columns:
-        tmp["_data_dt"] = pd.to_datetime(tmp[col_data], errors="coerce")
-        tmp = tmp.sort_values(by="_data_dt", ascending=False)
-
-    linha = tmp.iloc[0]
-    cpv = float(linha["_cmv"] / linha["_qtd"])
-    return cpv, "Fallback (ABS(CMV)/ABS(QTD_FAT)) - maior nota/data"
-
-
-def obter_frete_pct(der: BasesDerivadas, uf: str) -> float:
-    uf2 = (uf or "").strip().upper()
-    return float(der.frete_pct_by_uf.get(uf2, DefaultParams.FRETE_UF))
-
-
-def obter_vpc_pct(der: BasesDerivadas, cliente: str) -> float:
-    cli = norm_txt(cliente)
-    return float(der.vpc_pct_by_cliente.get(cli, 0.0))
-
-
-def obter_preco_atual(der: BasesDerivadas, cliente: str, codpro: str) -> Dict[str, float]:
-    cli = norm_txt(cliente)
-    return der.preco_atual_lookup.get(
-        (cli, codpro),
-        {"s_ipi": 0.0, "c_ipi": 0.0, "ipi_pct": der.ipi_pct_by_codpro.get(codpro, 0.0)},
-    )
-
-
-def _ufs_brasil() -> List[str]:
-    return [
-        "SP", "RJ", "MG", "BA", "PR", "RS", "SC", "ES", "GO", "DF",
-        "PE", "CE", "PA", "MA", "MT", "MS", "AM", "RO", "AC", "RR",
-        "AP", "TO", "PI", "RN", "PB", "AL", "SE",
-    ]
-
-
-# ==================== TELAS (principais) ====================
-def tela_consulta_precos(supabase, der: BasesDerivadas, params: Dict[str, float]):
-    st.title("🔎 Consulta de Preços + Margens (MC / EBITDA)")
-
-    st.markdown("### 📌 Inputs do usuário")
-    c1, c2, c3 = st.columns([2.2, 0.8, 1.2])
-
-    last = st.session_state.get("last_consulta", {})
-    default_prod = last.get("produto_prod", "")
-    default_uf = last.get("uf", "SP")
-    default_cli = last.get("cliente", "(não informado)")
-    default_usar_cliente = bool(last.get("usar_cliente", False))
-    default_aplicar_vpc = bool(last.get("aplicar_vpc", False))
-
-    with c1:
-        produtos = der.produtos_dropdown
-        idx = produtos.index(default_prod) if default_prod in produtos else 0
-        produto_prod = st.selectbox(
-            "Produto (pesquisa por descrição)",
-            options=produtos,
-            index=idx if produtos else 0,
-            help="Pesquisa pela descrição (coluna PROD da base Preços Atuais).",
-        )
-
-    with c2:
-        ufs = _ufs_brasil()
-        uf = st.selectbox("UF destino", options=ufs, index=ufs.index(default_uf) if default_uf in ufs else 0)
-
-    with c3:
-        usar_cliente = st.radio("Base de destino", options=["UF destino", "Cliente"], index=1 if default_usar_cliente else 0, horizontal=True)
-        usar_cliente_bool = usar_cliente == "Cliente"
-        if usar_cliente_bool:
-            cliente = st.selectbox("Cliente (opcional p/ VPC e preço médio)", options=der.clientes, index=der.clientes.index(default_cli) if default_cli in der.clientes else 0)
-        else:
-            cliente = "(não informado)"
-            st.selectbox("Cliente (opcional p/ VPC e preço médio)", options=der.clientes, index=0, disabled=True)
-
-    aplicar_vpc = st.toggle("Aplicar VPC", value=default_aplicar_vpc, help="Aplicar VPC (condicional por cliente).")
-    vpc_pct = obter_vpc_pct(der, cliente) if usar_cliente_bool else 0.0
-    st.caption(f"VPC do cliente: **{formatar_pct(vpc_pct)}**")
-
-    st.session_state["last_consulta"] = {
-        "produto_prod": produto_prod,
-        "uf": uf,
-        "cliente": cliente,
-        "usar_cliente": usar_cliente_bool,
-        "aplicar_vpc": aplicar_vpc,
+    status = {
+        "Preços Atuais": (ok1, msg1),
+        "Inventário": (ok2, msg2),
+        "Frete UF": (ok3, msg3),
+        "VPC por cliente": (ok4, msg4),
     }
 
-    if not produto_prod:
-        st.info("Selecione um produto.")
+    st.session_state["bases_cache"] = (df_precos, df_inv, df_frete, df_vpc)
+    st.session_state["bases_status"] = status
+
+def tela_consulta_precos(supabase, links: Dict[str, str], params: Dict[str, float], margens: Dict[str, float]):
+    st.title("🔎 Consulta de Preços + Margens (MC / EBITDA)")
+
+    # botão para performance
+    colA, colB = st.columns([1, 3])
+    with colA:
+        if st.button("🔄 Carregar/Atualizar Bases", type="primary", use_container_width=True):
+            carregar_bases_por_botao(links)
+
+    # se não carregou ainda, tenta usar cache existente
+    if st.session_state.get("bases_cache") is None:
+        st.info("Para melhor performance, clique em **Carregar/Atualizar Bases**.")
         return
 
-    codpro = der.prod_to_codpro.get(produto_prod, _extract_codpro_from_prod(produto_prod))
-    cpv, fonte_cpv = obter_cpv(der, codpro)
+    df_precos, df_inv, df_frete, df_vpc = st.session_state["bases_cache"]
+    status = st.session_state.get("bases_status") or {}
+
+    falhas = mostrar_status_bases(status)
+    if falhas:
+        st.error(f"⚠️ Revise os links de: {', '.join(falhas)}")
+        st.info("Acesse **Configurações** para atualizar os links.")
+        return
+
+    idx = preparar_indices(df_precos, df_inv, df_frete, df_vpc)
+
+    # -------- Inputs padrão (mesmo padrão de consulta) --------
+    st.subheader("📌 Inputs do usuário")
+
+    # persistência da última consulta
+    last = st.session_state.get("last_query", {})
+
+    c1, c2, c3 = st.columns([3, 1, 2])
+
+    with c1:
+        produtos = idx.get("lista_produtos", [])
+        if not produtos:
+            st.error("❌ Não encontrei coluna PROD/Descrição na base Preços Atuais.")
+            return
+        default_prod = last.get("produto") if last.get("produto") in produtos else produtos[0]
+        prod = st.selectbox("Produto (pesquisa por descrição)", produtos, index=produtos.index(default_prod), key="q_prod")
+
+    with c2:
+        uf = st.selectbox("UF destino", Config.UFS_BRASIL, index=Config.UFS_BRASIL.index(last.get("uf")) if last.get("uf") in Config.UFS_BRASIL else Config.UFS_BRASIL.index("SP"), key="q_uf")
+
+    with c3:
+        modo = st.radio("Base de destino", ["UF destino", "Cliente"], horizontal=True, index=0 if last.get("modo", "UF destino") == "UF destino" else 1, key="q_modo")
+        clientes = ["(não informado)"] + idx.get("lista_clientes", [])
+        default_cli = last.get("cliente") if last.get("cliente") in clientes else "(não informado)"
+        cliente = st.selectbox("Cliente (opcional p/ VPC e preço médio)", clientes, index=clientes.index(default_cli), disabled=(modo != "Cliente"), key="q_cliente")
+
+    codpro = parse_codpro_from_prod(prod)
+
+    # linha do produto (para margem alvo)
+    linha_prod = detectar_linha_produto(prod)
+    margem_alvo = float(margens.get(linha_prod.upper(), 0.30))
+
+    # vpc
+    vpc_cliente = 0.0
+    if modo == "Cliente" and cliente and cliente != "(não informado)":
+        vpc_cliente = obter_vpc_perc(cliente, df_vpc, idx)
+
+    aplicar_vpc = st.toggle("Aplicar VPC", value=bool(last.get("aplicar_vpc", False)), key="q_vpc")
+    st.caption(f"VPC do cliente: **{formatar_pct(vpc_cliente)}**")
+
+    # consulta por botão (performance)
+    if st.button("📌 Consultar", use_container_width=True):
+        st.session_state["last_query"] = {
+            "produto": prod,
+            "uf": uf,
+            "modo": modo,
+            "cliente": cliente,
+            "aplicar_vpc": aplicar_vpc
+        }
+        st.rerun()
+
+    # se nunca consultou, não calcula
+    if not st.session_state.get("last_query"):
+        st.info("Selecione os parâmetros e clique em **Consultar**.")
+        return
+
+    # aplica do last_query (garantir consistência)
+    q = st.session_state["last_query"]
+    prod = q["produto"]
+    uf = q["uf"]
+    modo = q["modo"]
+    cliente = q["cliente"]
+    aplicar_vpc = q["aplicar_vpc"]
+    codpro = parse_codpro_from_prod(prod)
+    linha_prod = detectar_linha_produto(prod)
+    margem_alvo = float(margens.get(linha_prod.upper(), 0.30))
+
+    # frete %
+    frete_perc = obter_frete_perc(uf, df_frete, idx)
+
+    # preço atual + ipi derivado
+    cli_for_price = cliente if (modo == "Cliente" and cliente != "(não informado)") else None
+    preco_atual_s, preco_atual_c, ipi_derivado = obter_preco_atual_e_ipi(codpro, cli_for_price, df_precos, idx)
+    ipi_perc = ipi_derivado
+
+    # CPV
+    cpv, fonte_cpv = obter_cpv(codpro, df_inv, df_precos, idx)
     if cpv <= 0:
-        st.error("❌ Não consegui obter o CPV (custo). Confirme o Inventário (coluna CUSTO) ou o fallback (CMV e QTD_FAT) na base Preços Atuais.")
+        st.error("❌ Não consegui obter o CPV (custo). Confirme a base Inventário (coluna CUSTO) ou fallback (CMV e QTD_FAT) na base Preços Atuais.")
         st.caption(f"Chave interna (CODPRO): {codpro} | Fonte tentada: {fonte_cpv}")
         return
 
-    frete_pct = obter_frete_pct(der, uf)
+    # VPC aplicado
+    vpc_aplicado = vpc_cliente if (modo == "Cliente" and cliente != "(não informado)" and aplicar_vpc) else 0.0
 
-    preco_atual = obter_preco_atual(der, cliente, codpro)
-    ipi_pct = float(preco_atual.get("ipi_pct", 0.0)) if preco_atual else float(der.ipi_pct_by_codpro.get(codpro, 0.0))
-    vpc_eff = vpc_pct if (usar_cliente_bool and aplicar_vpc) else 0.0
-
-    res, msg = calcular_precificacao_v3(
-        cpv=cpv,
-        ipi_pct=ipi_pct,
-        frete_pct=frete_pct,
-        vpc_pct=vpc_eff,
-        params=params,
-    )
-    if not res:
-        st.error(f"❌ {msg}")
+    # calcula política v3
+    try:
+        out, audit = calcular_precificacao_v3(
+            cpv=cpv,
+            ipi_perc=ipi_perc,
+            frete_perc=frete_perc,
+            vpc_perc=vpc_aplicado,
+            margem_alvo=margem_alvo,
+            params=params
+        )
+    except Exception as e:
+        st.error(tradutor_erro(e))
         return
 
+    # registra log
+    registrar_log(supabase, {
+        "usuario": st.session_state.get("email"),
+        "sku": codpro,
+        "cliente": None if cliente == "(não informado)" else cliente,
+        "uf": uf,
+        "datahora": datetime.now().isoformat(),
+        "preco_calculado": float(out["Preco_Com_IPI"]),
+        "mc_pct": float(out["MC_pct"]),
+        "ebitda_pct": float(out["EBITDA_pct"])
+    })
+
+    # outputs
     st.divider()
-    st.markdown("### 📌 Output Executivo")
-    o1, o2, o3, o4, o5 = st.columns(5)
-    with o1:
-        st.metric("Preço Sugerido s/ IPI", formatar_moeda(res.preco_sem_ipi))
-    with o2:
-        st.metric("Preço Sugerido c/ IPI", formatar_moeda(res.preco_com_ipi))
-    with o3:
-        st.metric("MC", f"{res.mc_pct*100:.2f}%", formatar_moeda(res.lucro_bruto))
-    with o4:
-        st.metric("EBITDA", f"{res.ebitda_pct*100:.2f}%", formatar_moeda(res.ebitda_rs))
-    with o5:
-        st.metric("Frete % (UF)", formatar_pct(frete_pct))
+    st.subheader("📌 Output Executivo")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("Preço Sugerido s/ IPI", formatar_moeda(out["Preco_Sem_IPI"]))
+    with c2:
+        st.metric("Preço Sugerido c/ IPI", formatar_moeda(out["Preco_Com_IPI"]))
+    with c3:
+        st.metric("MC (%)", f"{out['MC_pct']*100:.2f}%", delta=formatar_moeda(out["Lucro_Bruto"]))
+    with c4:
+        st.metric("EBITDA (%)", f"{out['EBITDA_pct']*100:.2f}%", delta=formatar_moeda(out["EBITDA_R"]))
+    with c5:
+        st.metric("Frete % (UF)", f"{frete_perc*100:.2f}%")
 
     st.divider()
-    st.markdown("### 📌 Preço Atual (duas colunas)")
-    p1, p2, p3 = st.columns([1, 1, 1])
+    st.subheader("📌 Preço Atual (duas colunas)")
+    p1, p2, p3 = st.columns(3)
     with p1:
-        st.metric("Preço Atual s/ IPI", formatar_moeda(float(preco_atual.get("s_ipi", 0.0))))
+        st.metric("Preço Atual s/ IPI", formatar_moeda(preco_atual_s))
     with p2:
-        st.metric("Preço Atual c/ IPI", formatar_moeda(float(preco_atual.get("c_ipi", 0.0))))
+        st.metric("Preço Atual c/ IPI", formatar_moeda(preco_atual_c))
     with p3:
-        st.metric("% IPI (derivado)", f"{ipi_pct*100:.2f}%")
+        st.metric("% IPI (derivado)", f"{ipi_perc*100:.2f}%")
 
+    # governança (apenas admin)
     if is_admin(st.session_state.get("perfil", "")):
-        with st.expander("🧾 Detalhamento (governança) — cálculo explícito", expanded=False):
-            st.write(f"**Produto (PROD):** {produto_prod}")
+        with st.expander("🧾 Detalhamento (governança) — cálculo explícito", expanded=True):
+            st.write(f"**Produto (descrição):** {prod}")
             st.write(f"**CODPRO (chave interna):** {codpro}")
-            st.write(f"**CPV usado:** {formatar_moeda(cpv)}  _(fonte: {fonte_cpv})_")
-            st.write(f"**Frete% UF ({uf}):** {formatar_pct(frete_pct)}")
-            st.write(f"**VPC% aplicado:** {formatar_pct(vpc_eff)}")
-            st.write(f"**IPI% derivado:** {formatar_pct(ipi_pct)}")
+            st.write(f"**Linha detectada:** {linha_prod} | **MC Alvo (linha):** {margem_alvo*100:.2f}%")
+            st.write(f"**CPV usado:** {formatar_moeda(cpv)} (**fonte:** {fonte_cpv})")
+            st.write(f"**UF:** {uf} | **Frete%:** {frete_perc*100:.2f}%")
+            st.write(f"**Cliente:** {cliente} | **Aplicar VPC:** {aplicar_vpc} | **VPC% aplicado:** {vpc_aplicado*100:.2f}%")
+            st.write(f"**IPI% derivado do preço atual:** {ipi_perc*100:.2f}%")
 
-
-def tela_pedido_venda(supabase, der: BasesDerivadas, params: Dict[str, float]):
-    st.title("🧾 Pedido de Venda — Simulação por Itens")
-    st.info("Mantida sem mudanças nesta versão (apenas ajuste no fallback do CPV).")
-
-
-def tela_dashboard(supabase):
-    st.title("📊 Dashboard — Simulações (Logs)")
-    st.info("Mantida sem mudanças nesta versão (apenas ajuste no fallback do CPV).")
-
-
-def tela_configuracoes(supabase, links: Dict[str, str], params: Dict[str, float]):
-    st.title("⚙️ Configurações (ADM/Master)")
-    st.info("Mantida sem mudanças nesta versão (apenas ajuste no fallback do CPV).")
-
+            st.divider()
+            st.markdown("### Linha a linha (auditoria)")
+            # imprime em tabela (melhor leitura)
+            aud_rows = [{"Item": k, "Valor": (formatar_moeda(v) if isinstance(v, (int, float)) and ("%" not in k and "_%" not in k and "pct" not in k.lower()) else (f"{v*100:.6f}%" if isinstance(v, (int, float)) and ("%" in k or "_%" in k or "pct" in k.lower()) else str(v)))} for k, v in audit.items()]
+            st.dataframe(pd.DataFrame(aud_rows), use_container_width=True, hide_index=True)
 
 def tela_sobre():
-    st.title("ℹ️ Sobre o Sistema")
-    st.write(f"**Versão:** {__version__}  |  **Data:** {__release_date__}")
-    st.write("**Últimas alterações:**")
+    st.title("ℹ️ Sobre")
+    st.write(f"**Versão:** {__version__} | **Data:** {__release_date__}")
+    st.markdown("**Últimas alterações:**")
     for x in __last_changes__:
         st.write(f"- {x}")
 
-
-# ==================== MAIN ====================
+# ==================== APP PRINCIPAL ====================
 def main():
-    init_session()
-    supabase = get_supabase()
-
+    inicializar_sessao()
+    supabase = init_connection()
     if not supabase:
-        st.error("❌ Sem conexão com Supabase. Confira SUPABASE_URL e SUPABASE_KEY no Secrets.")
-        st.stop()
+        st.error("❌ Falha ao validar Supabase. Revise Secrets (SUPABASE_URL / SUPABASE_KEY).")
+        return
 
     if not st.session_state["autenticado"]:
         tela_login(supabase)
         return
 
+    # Sidebar
     with st.sidebar:
         st.title(f"👤 {st.session_state.get('nome')}")
-        st.caption(f"🎭 {st.session_state.get('perfil')}")
+        st.caption(f"Perfil: {st.session_state.get('perfil')}")
         st.divider()
 
-        menu_items = ["🔎 Consulta", "🧾 Pedido de Venda", "📊 Dashboard", "ℹ️ Sobre"]
-        if is_admin(st.session_state.get("perfil", "")):
-            menu_items.insert(3, "⚙️ Configurações")
+        links = carregar_links(supabase)
+        params = carregar_parametros(supabase)
+        margens = carregar_margens_linha(supabase)
 
-        menu = st.radio("Menu", menu_items, label_visibility="collapsed")
+        opcoes = ["🔎 Consulta de Preços", "ℹ️ Sobre"]
+        if is_admin(st.session_state.get("perfil", "")):
+            opcoes.insert(1, "⚙️ Configurações")
+
+        menu = st.radio("Menu", opcoes)
 
         st.divider()
         if st.button("🚪 Sair", use_container_width=True):
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
-        st.divider()
+
         st.caption(f"v{__version__} | {__release_date__}")
 
+    # Conteúdo
+    # recarrega (sem cache em variáveis) pois já está em cache_data
     links = carregar_links(supabase)
     params = carregar_parametros(supabase)
+    margens = carregar_margens_linha(supabase)
 
-    st.session_state.setdefault("bases_derivadas", None)
-
-    if st.session_state["bases_derivadas"] is None:
-        st.info("📥 Bases ainda não carregadas. Clique em **Atualizar bases** para iniciar.")
-    if st.button("🔄 Atualizar bases", type="primary", use_container_width=True):
-        with st.spinner("Carregando bases..."):
-            der, status = carregar_bases_on_demand(links)
-        st.session_state["bases_status"] = status
-        st.session_state["bases_derivadas"] = der
-        if der:
-            st.success("✅ Bases carregadas com sucesso")
-        else:
-            st.error("❌ Falha ao carregar bases (ver Status das Bases).")
-
-    status = st.session_state.get("bases_status", {})
-    if status:
-        falhas = status_bases_ui(status)
-        if falhas:
-            st.warning("Ajuste os links nas Configurações (ADM/Master) e clique em Atualizar bases novamente.")
-
-    der = st.session_state.get("bases_derivadas", None)
-
-    if menu == "🔎 Consulta":
-        if der is None:
-            st.stop()
-        tela_consulta_precos(supabase, der, params)
-
-    elif menu == "🧾 Pedido de Venda":
-        if der is None:
-            st.stop()
-        tela_pedido_venda(supabase, der, params)
-
-    elif menu == "📊 Dashboard":
-        tela_dashboard(supabase)
-
+    if menu == "🔎 Consulta de Preços":
+        tela_consulta_precos(supabase, links, params, margens)
     elif menu == "⚙️ Configurações":
-        tela_configuracoes(supabase, links, params)
-
-    elif menu == "ℹ️ Sobre":
+        tela_configuracoes(supabase, links, params, margens)
+    else:
         tela_sobre()
-
 
 if __name__ == "__main__":
     main()
