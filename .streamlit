@@ -1,1 +1,2 @@
-secrets.toml
+SUPABASE_URL = "SUA_URL_AQUI"
+SUPABASE_KEY = "SUA_KEY_AQUI"
